@@ -708,6 +708,8 @@ func TestConcurrentIncrements(t *testing.T) {
 	}
 }
 
+const valueSize = 1 << 10
+
 func setupClientBenchData(numVersions, numKeys int, b *testing.B) (*server.TestServer, *client.KV) {
 	const cacheSize = 8 << 30 // 8 GB
 	loc := fmt.Sprintf("client_bench_%d_%d", numVersions, numKeys)
@@ -744,7 +746,7 @@ func setupClientBenchData(numVersions, numKeys int, b *testing.B) (*server.TestS
 			// Only write values if this iteration is less than the random
 			// number of versions chosen for this key.
 			if t <= nvs[i] {
-				args := proto.PutArgs(proto.Key(keys[i]), util.RandBytes(rng, 1024))
+				args := proto.PutArgs(proto.Key(keys[i]), util.RandBytes(rng, valueSize))
 				args.Timestamp = proto.Timestamp{WallTime: time.Now().UnixNano()}
 				kv.Prepare(proto.Put, args, resp)
 			}
@@ -771,12 +773,12 @@ func setupClientBenchData(numVersions, numKeys int, b *testing.B) (*server.TestS
 // keys over all of the data, restarting at the beginning of the
 // keyspace, as many times as necessary.
 func runClientScan(numRows, numVersions int, b *testing.B) {
-	// TODO(pmattis): Bump this to 100K when scanning across ranges is fixed.
-	const numKeys = 10000
+	const numKeys = 100000
+
 	s, kv := setupClientBenchData(numVersions, numKeys, b)
 	defer s.Stop()
 
-	b.SetBytes(int64(numRows * 1024))
+	b.SetBytes(int64(numRows * valueSize))
 	b.ResetTimer()
 
 	b.RunParallel(func(pb *testing.PB) {
