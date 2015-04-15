@@ -454,22 +454,22 @@ func TestTxnTimestampRegression(t *testing.T) {
 	}
 	err = db.RunTransaction(txnOpts, func(txn *client.KV) error {
 		// Put transactional value.
-		if err := txn.Call(proto.Put, proto.PutArgs(keyA, []byte("value1")), &proto.PutResponse{}); err != nil {
+		if err := txn.Call(proto.PutArgs(keyA, []byte("value1")), &proto.PutResponse{}); err != nil {
 			return err
 		}
 
 		// Attempt to read outside of txn (this will push timestamp of transaction).
-		if err := db.Call(proto.Get, proto.GetArgs(keyA), &proto.GetResponse{}); err != nil {
+		if err := db.Call(proto.GetArgs(keyA), &proto.GetResponse{}); err != nil {
 			return err
 		}
 
 		// Now, read again outside of txn to warmup timestamp cache with higher timestamp.
-		if err := db.Call(proto.Get, proto.GetArgs(keyB), &proto.GetResponse{}); err != nil {
+		if err := db.Call(proto.GetArgs(keyB), &proto.GetResponse{}); err != nil {
 			return err
 		}
 
 		// Write now to keyB, which will get a higher timestamp than keyB was written at.
-		if err := txn.Call(proto.Put, proto.PutArgs(keyB, []byte("value2")), &proto.PutResponse{}); err != nil {
+		if err := txn.Call(proto.PutArgs(keyB, []byte("value2")), &proto.PutResponse{}); err != nil {
 			return err
 		}
 		return nil
