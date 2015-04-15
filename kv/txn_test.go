@@ -58,13 +58,13 @@ func TestTxnDBBasics(t *testing.T) {
 		}
 		err := db.RunTransaction(txnOpts, func(txn *client.KV) error {
 			// Put transactional value.
-			if err := txn.Call(proto.Put, proto.PutArgs(key, value), &proto.PutResponse{}); err != nil {
+			if err := txn.Call(proto.PutArgs(key, value), &proto.PutResponse{}); err != nil {
 				return err
 			}
 
 			// Attempt to read outside of txn.
 			gr := &proto.GetResponse{}
-			if err := db.Call(proto.Get, proto.GetArgs(key), gr); err != nil {
+			if err := db.Call(proto.GetArgs(key), gr); err != nil {
 				return err
 			}
 			if gr.Value != nil {
@@ -72,7 +72,7 @@ func TestTxnDBBasics(t *testing.T) {
 			}
 
 			// Read within the transaction.
-			if err := txn.Call(proto.Get, proto.GetArgs(key), gr); err != nil {
+			if err := txn.Call(proto.GetArgs(key), gr); err != nil {
 				return err
 			}
 			if gr.Value == nil || !bytes.Equal(gr.Value.Bytes, value) {
@@ -93,7 +93,7 @@ func TestTxnDBBasics(t *testing.T) {
 
 		// Verify the value is now visible on commit == true, and not visible otherwise.
 		gr := &proto.GetResponse{}
-		err = db.Call(proto.Get, proto.GetArgs(key), gr)
+		err = db.Call(proto.GetArgs(key), gr)
 		if commit {
 			if err != nil || gr.Value == nil || !bytes.Equal(gr.Value.Bytes, value) {
 				t.Errorf("expected success reading value: %+v, %s", gr.Value, err)
@@ -124,7 +124,7 @@ func BenchmarkTxnWrites(b *testing.B) {
 		if tErr := db.RunTransaction(txnOpts, func(txn *client.KV) error {
 			pr := &proto.PutResponse{}
 			pa := proto.PutArgs(key, []byte(fmt.Sprintf("value-%d", i)))
-			if err := txn.Call(proto.Put, pa, pr); err != nil {
+			if err := txn.Call(pa, pr); err != nil {
 				b.Fatal(err)
 			}
 			return nil
@@ -170,7 +170,7 @@ func verifyUncertainty(concurrency int, maxOffset time.Duration, t *testing.T) {
 		}
 		readValue := []byte(fmt.Sprintf("value-%d", i+skipCount))
 		pr := proto.PutResponse{}
-		db.Call(proto.Put, &proto.PutRequest{
+		db.Call(&proto.PutRequest{
 			RequestHeader: proto.RequestHeader{
 				Key: key,
 			},
@@ -180,7 +180,7 @@ func verifyUncertainty(concurrency int, maxOffset time.Duration, t *testing.T) {
 			t.Errorf("%d: got write error: %v", i, err)
 		}
 		gr := proto.GetResponse{}
-		db.Call(proto.Get, &proto.GetRequest{
+		db.Call(&proto.GetRequest{
 			RequestHeader: proto.RequestHeader{
 				Key:       key,
 				Timestamp: clock.Now(),
@@ -215,7 +215,7 @@ func verifyUncertainty(concurrency int, maxOffset time.Duration, t *testing.T) {
 			if err := txnDB.RunTransaction(txnOpts, func(txn *client.KV) error {
 				// Read within the transaction.
 				gr := proto.GetResponse{}
-				txn.Call(proto.Get, &proto.GetRequest{
+				txn.Call(&proto.GetRequest{
 					RequestHeader: proto.RequestHeader{
 						Key:       key,
 						Timestamp: futureTS,
@@ -324,7 +324,7 @@ func TestUncertaintyRestarts(t *testing.T) {
 				t.Fatal(err)
 			}
 			gr.Reset()
-			if err := txn.Call(proto.Get, proto.GetArgs(key), gr); err != nil {
+			if err := txn.Call(proto.GetArgs(key), gr); err != nil {
 				return err
 			}
 			if gr.Value == nil || !bytes.Equal(gr.Value.Bytes, wantedBytes) {
@@ -392,7 +392,7 @@ func TestUncertaintyMaxTimestampForwarding(t *testing.T) {
 		// The first command serves to start a Txn, fixing the timestamps.
 		// There will be a restart, but this is idempotent.
 		sr := &proto.ScanResponse{}
-		if err = txn.Call(proto.Scan, proto.ScanArgs(proto.Key("t"), proto.Key("t"),
+		if err = txn.Call(proto.ScanArgs(proto.Key("t"), proto.Key("t"),
 			0), sr); err != nil {
 			t.Fatal(err)
 		}
@@ -407,7 +407,7 @@ func TestUncertaintyMaxTimestampForwarding(t *testing.T) {
 		// not happen, the read of keyFast should fail (i.e. read nothing).
 		// There will be exactly one restart here.
 		gr := &proto.GetResponse{}
-		if err = txn.Call(proto.Get, proto.GetArgs(keySlow), gr); err != nil {
+		if err = txn.Call(proto.GetArgs(keySlow), gr); err != nil {
 			if i != 1 {
 				t.Errorf("unexpected transaction error: %v", err)
 			}
@@ -421,7 +421,7 @@ func TestUncertaintyMaxTimestampForwarding(t *testing.T) {
 		gr.Reset()
 		// The node should already be certain, so we expect no restart here
 		// and to read the correct key.
-		if err = txn.Call(proto.Get, proto.GetArgs(keyFast), gr); err != nil {
+		if err = txn.Call(proto.GetArgs(keyFast), gr); err != nil {
 			t.Errorf("second Get failed with %v", err)
 		}
 		if gr.Value == nil || !bytes.Equal(gr.Value.Bytes, valFast) {

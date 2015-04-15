@@ -102,7 +102,7 @@ func (ls *LocalSender) Send(call *client.Call) {
 	// If we fail with two in a row, pass the error up to caller and
 	// let the remote client requery range metadata.
 	retryOpts := util.RetryOptions{
-		Tag:         fmt.Sprintf("routing %s locally", call.Method),
+		Tag:         fmt.Sprintf("routing %s locally", call.Method()),
 		MaxAttempts: 2,
 	}
 	util.RetryWithBackoff(retryOpts, func() (util.RetryStatus, error) {
@@ -148,7 +148,7 @@ func (ls *LocalSender) Send(call *client.Call) {
 				}
 			}
 
-			if err = store.ExecuteCmd(call.Method, call.Args, call.Reply); err != nil {
+			if err = store.ExecuteCmd(call.Method(), call.Args, call.Reply); err != nil {
 				// Check for range key mismatch error (this could happen if
 				// range was split between lookup and execution). In this case,
 				// reset header.Replica and engage retry loop.
