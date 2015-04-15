@@ -187,7 +187,7 @@ type Range struct {
 	lastIndex uint64
 	// Last index applied to the state machine.
 	appliedIndex uint64
-	lease        unsafe.Pointer // Information for leader lease
+	lease        unsafe.Pointer // Information for leader lease, updated atomically
 
 	sync.RWMutex                 // Protects the following fields (and Desc)
 	cmdQ         *CommandQueue   // Enforce at most one command is running per key(s)
@@ -285,7 +285,7 @@ func (r *Range) newNotLeaderError() error {
 	err := &proto.NotLeaderError{}
 	if l := r.getLease(); l != nil {
 		_, storeID := DecodeRaftNodeID(multiraft.NodeID(l.RaftNodeID))
-		err.Leader = r.Desc().FindReplica(storeID)
+		_, err.Leader = r.Desc().FindReplica(storeID)
 	}
 	return err
 }
