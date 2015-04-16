@@ -56,7 +56,7 @@ func TestTxnDBBasics(t *testing.T) {
 			Name:      "test",
 			Isolation: proto.SNAPSHOT,
 		}
-		err := db.RunTransaction(txnOpts, func(txn *client.KV) error {
+		err := db.RunTransaction(txnOpts, func(txn *client.Txn) error {
 			// Put transactional value.
 			if err := txn.Run(client.PutCall(key, value, nil)); err != nil {
 				return err
@@ -121,7 +121,7 @@ func BenchmarkTxnWrites(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		mClock.Increment(1)
-		if tErr := db.RunTransaction(txnOpts, func(txn *client.KV) error {
+		if tErr := db.RunTransaction(txnOpts, func(txn *client.Txn) error {
 			if err := txn.Run(client.PutCall(key, []byte(fmt.Sprintf("value-%d", i)), nil)); err != nil {
 				b.Fatal(err)
 			}
@@ -214,7 +214,7 @@ func verifyUncertainty(concurrency int, maxOffset time.Duration, t *testing.T) {
 			txnDB := client.NewKV(nil, sender)
 			txnDB.User = storage.UserRoot
 
-			if err := txnDB.RunTransaction(txnOpts, func(txn *client.KV) error {
+			if err := txnDB.RunTransaction(txnOpts, func(txn *client.Txn) error {
 				// Read within the transaction.
 				gr := proto.GetResponse{}
 				txn.Run(&client.Call{
@@ -317,7 +317,7 @@ func TestUncertaintyRestarts(t *testing.T) {
 		}
 		gr := &proto.GetResponse{}
 		i := -1
-		tErr := db.RunTransaction(txnOpts, func(txn *client.KV) error {
+		tErr := db.RunTransaction(txnOpts, func(txn *client.Txn) error {
 			i++
 			mClock.Increment(1)
 			futureTS := clock.Now()
@@ -391,7 +391,7 @@ func TestUncertaintyMaxTimestampForwarding(t *testing.T) {
 	}
 
 	i := 0
-	if tErr := db.RunTransaction(txnOpts, func(txn *client.KV) error {
+	if tErr := db.RunTransaction(txnOpts, func(txn *client.Txn) error {
 		i++
 		// The first command serves to start a Txn, fixing the timestamps.
 		// There will be a restart, but this is idempotent.
@@ -455,7 +455,7 @@ func TestTxnTimestampRegression(t *testing.T) {
 		Name:      "test",
 		Isolation: proto.SNAPSHOT,
 	}
-	err = db.RunTransaction(txnOpts, func(txn *client.KV) error {
+	err = db.RunTransaction(txnOpts, func(txn *client.Txn) error {
 		// Put transactional value.
 		if err := txn.Run(client.PutCall(keyA, []byte("value1"), nil)); err != nil {
 			return err
