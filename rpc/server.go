@@ -78,12 +78,19 @@ var connected = "200 Connected to Go RPC"
 
 // ServeHTTP implements an http.Handler that answers RPC requests.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	log.Infof("Request TLS: %+v", r.TLS)
 	if r.URL.Path != rpc.DefaultRPCPath {
+		log.Infof("HTTP request")
 		if s.handler != nil {
 			s.handler.ServeHTTP(w, r)
 			return
 		}
 		http.NotFound(w, r)
+		return
+	}
+	log.Infof("RPC request")
+	if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 {
+		http.Error(w, "401 No client certificates found", http.StatusUnauthorized)
 		return
 	}
 	// Note: this code was adapted from net/rpc.Server.ServeHTTP.

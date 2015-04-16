@@ -40,7 +40,7 @@ const (
 	// KVDBScheme is the scheme for connecting to the kvdb endpoint.
 	// TODO(spencer): change this to CONSTANT https. We shouldn't be
 	// supporting http here at all.
-	KVDBScheme = "http"
+	KVDBScheme = "https"
 	// StatusTooManyRequests indicates client should retry due to
 	// server having too many requests.
 	StatusTooManyRequests = 429
@@ -74,9 +74,7 @@ type HTTPSender struct {
 func NewHTTPSender(server string, transport *http.Transport) *HTTPSender {
 	return &HTTPSender{
 		server: server,
-		client: &http.Client{
-			Transport: transport,
-		},
+		client: &http.Client{Transport: transport},
 	}
 }
 

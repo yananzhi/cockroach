@@ -96,12 +96,29 @@ func LoadTLSConfig(certPEM, keyPEM, caPEM []byte) (*TLSConfig, error) {
 	return &TLSConfig{
 		config: &tls.Config{
 			Certificates: []tls.Certificate{cert},
-			ClientAuth:   tls.RequireAndVerifyClientCert,
-			RootCAs:      certPool,
-			ClientCAs:    certPool,
+			//					ClientAuth:   tls.RequireAndVerifyClientCert,
+			// Apparently clients are bad about this.
+			ClientAuth: tls.VerifyClientCertIfGiven,
+			RootCAs:    certPool,
+			ClientCAs:  certPool,
 
-			// TODO(jqmp): Set CipherSuites?
-			// TODO(jqmp): Set MinVersion?
+			// From: http://www.hydrogen18.com/blog/your-own-pki-tls-golang.html
+			// Trust, but verify! Let's find something more authoritative.
+			CipherSuites: []uint16{
+				tls.TLS_RSA_WITH_AES_128_CBC_SHA,
+				tls.TLS_RSA_WITH_AES_256_CBC_SHA,
+				tls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA,
+				tls.TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA,
+				tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
+				tls.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
+				tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+				tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256},
+
+			// Use only TLS v1.2
+			MinVersion: tls.VersionTLS12,
+
+			// Should we disable session resumption? This may break forward secrecy.
+			// SessionTicketsDisabled: true,
 		},
 	}, nil
 }

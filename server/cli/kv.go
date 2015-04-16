@@ -23,8 +23,10 @@ import (
 	"bytes"
 	"flag"
 	"fmt"
+	"io/ioutil"
 	"net/http"
 	"os"
+	"path"
 	"strconv"
 	"strings"
 
@@ -33,6 +35,10 @@ import (
 	"github.com/cockroachdb/cockroach/rpc"
 	"github.com/cockroachdb/cockroach/storage/engine"
 	"github.com/cockroachdb/cockroach/util"
+	"github.com/cockroachdb/cockroach/util/log"
+
+	"crypto/tls"
+	"crypto/x509"
 
 	commander "code.google.com/p/go-commander"
 )
@@ -41,11 +47,26 @@ var osExit = os.Exit
 var osStderr = os.Stderr
 
 func makeKVClient() *client.KV {
-	transport := &http.Transport{
-		TLSClientConfig: rpc.LoadInsecureTLSConfig().Config(),
+	var tlsConfig *tls.Config
+	if Context.Certs == "" {
+		log.Infof("No Context.Certs, using insecure TLS")
+		tlsConfig = rpc.LoadInsecureTLSConfig().Config()
+	} else {
+		log.Infof("Got Context.Certs=%s, setting up TLS", Context.Certs)
+		cert, err := ioutil.ReadFile(path.Join(Context.Certs, "ca.crt"))
+		if err != nil {
+			log.Fatalf("error reading cert file %s: %v", path.Join(Context.Certs, "ca.crt"), err)
+		}
+
+		certPool := x509.NewCertPool()
+		if ok := certPool.AppendCertsFromPEM(cert); !ok {
+			log.Fatalf("failed to parse PEM data to pool")
+		}
+		tlsConfig = &tls.Config{RootCAs: certPool, InsecureSkipVerify: true}
 	}
+
 	kv := client.NewKV(nil, client.NewHTTPSender(
-		util.EnsureHost(Context.Addr), transport))
+		util.EnsureHost(Context.Addr), &http.Transport{TLSClientConfig: tlsConfig}))
 	// TODO(pmattis): Initialize this to something more reasonable
 	kv.User = "root"
 	return kv
