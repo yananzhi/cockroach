@@ -113,7 +113,7 @@ func TestTxnCoordSenderAddRequest(t *testing.T) {
 	putReq := createPutRequest(proto.Key("a"), []byte("value"), txn)
 
 	// Put request will create a new transaction.
-	if err := db.Call(putReq, &proto.PutResponse{}); err != nil {
+	if err := db.Run(&client.Call{Args: putReq, Reply: &proto.PutResponse{}}); err != nil {
 		t.Fatal(err)
 	}
 	txnMeta, ok := coord.txns[string(txn.ID)]
@@ -130,7 +130,7 @@ func TestTxnCoordSenderAddRequest(t *testing.T) {
 	coord.Lock()
 	manual.Set(1)
 	coord.Unlock()
-	if err := db.Call(putReq, &proto.PutResponse{}); err != nil {
+	if err := db.Run(&client.Call{Args: putReq, Reply: &proto.PutResponse{}}); err != nil {
 		t.Fatal(err)
 	}
 	if len(coord.txns) != 1 {
@@ -245,7 +245,7 @@ func TestTxnCoordSenderKeyRanges(t *testing.T) {
 		// Trick the coordinator into using the EndKey for coordinator
 		// resolve keys interval cache.
 		putReq.EndKey = rng.end
-		if err := db.Call(putReq, &proto.PutResponse{}); err != nil {
+		if err := db.Run(&client.Call{Args: putReq, Reply: &proto.PutResponse{}}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -273,10 +273,14 @@ func TestTxnCoordSenderMultipleTxns(t *testing.T) {
 
 	txn1 := newTxn(db, clock, proto.Key("a"))
 	txn2 := newTxn(db, clock, proto.Key("b"))
-	if err := db.Call(createPutRequest(proto.Key("a"), []byte("value"), txn1), &proto.PutResponse{}); err != nil {
+	if err := db.Run(&client.Call{
+		Args:  createPutRequest(proto.Key("a"), []byte("value"), txn1),
+		Reply: &proto.PutResponse{}}); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.Call(createPutRequest(proto.Key("b"), []byte("value"), txn2), &proto.PutResponse{}); err != nil {
+	if err := db.Run(&client.Call{
+		Args:  createPutRequest(proto.Key("b"), []byte("value"), txn2),
+		Reply: &proto.PutResponse{}}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -299,7 +303,9 @@ func TestTxnCoordSenderHeartbeat(t *testing.T) {
 	coord.heartbeatInterval = 1 * time.Millisecond
 
 	txn := newTxn(db, clock, proto.Key("a"))
-	if err := db.Call(createPutRequest(proto.Key("a"), []byte("value"), txn), &proto.PutResponse{}); err != nil {
+	if err := db.Run(&client.Call{
+		Args:  createPutRequest(proto.Key("a"), []byte("value"), txn),
+		Reply: &proto.PutResponse{}}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -330,12 +336,13 @@ func TestTxnCoordSenderHeartbeat(t *testing.T) {
 // getTxn fetches the requested key and returns the transaction info.
 func getTxn(db *client.KV, txn *proto.Transaction) (bool, *proto.Transaction, error) {
 	hr := &proto.InternalHeartbeatTxnResponse{}
-	if err := db.Call(&proto.InternalHeartbeatTxnRequest{
-		RequestHeader: proto.RequestHeader{
-			Key: txn.Key,
-			Txn: txn,
-		},
-	}, hr); err != nil {
+	if err := db.Run(&client.Call{
+		Args: &proto.InternalHeartbeatTxnRequest{
+			RequestHeader: proto.RequestHeader{
+				Key: txn.Key,
+				Txn: txn,
+			},
+		}, Reply: hr}); err != nil {
 		return false, nil, err
 	}
 	return true, hr.Txn, nil
@@ -372,7 +379,9 @@ func TestTxnCoordSenderEndTxn(t *testing.T) {
 	txn := newTxn(db, clock, proto.Key("a"))
 	pReply := &proto.PutResponse{}
 	key := proto.Key("a")
-	if err := db.Call(createPutRequest(key, []byte("value"), txn), pReply); err != nil {
+	if err := db.Run(&client.Call{
+		Args:  createPutRequest(key, []byte("value"), txn),
+		Reply: pReply}); err != nil {
 		t.Fatal(err)
 	}
 	if pReply.GoError() != nil {
@@ -409,7 +418,9 @@ func TestTxnCoordSenderCleanupOnAborted(t *testing.T) {
 	key := proto.Key("a")
 	txn := newTxn(db, clock, key)
 	txn.Priority = 1
-	if err := db.Call(createPutRequest(key, []byte("value"), txn), &proto.PutResponse{}); err != nil {
+	if err := db.Run(&client.Call{
+		Args:  createPutRequest(key, []byte("value"), txn),
+		Reply: &proto.PutResponse{}}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -424,7 +435,9 @@ func TestTxnCoordSenderCleanupOnAborted(t *testing.T) {
 		PusheeTxn: *txn,
 		Abort:     true,
 	}
-	if err := db.Call(pushArgs, &proto.InternalPushTxnResponse{}); err != nil {
+	if err := db.Run(&client.Call{
+		Args:  pushArgs,
+		Reply: &proto.InternalPushTxnResponse{}}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -438,7 +451,9 @@ func TestTxnCoordSenderCleanupOnAborted(t *testing.T) {
 		},
 		Commit: true,
 	}
-	err = db.Call(etArgs, &proto.EndTransactionResponse{})
+	err = db.Run(&client.Call{
+		Args:  etArgs,
+		Reply: &proto.EndTransactionResponse{}})
 	switch err.(type) {
 	case nil:
 		t.Fatal("expected txn aborted error")
@@ -464,7 +479,9 @@ func TestTxnCoordSenderGC(t *testing.T) {
 	coord.heartbeatInterval = 1 * time.Millisecond
 
 	txn := newTxn(db, clock, proto.Key("a"))
-	if err := db.Call(createPutRequest(proto.Key("a"), []byte("value"), txn), &proto.PutResponse{}); err != nil {
+	if err := db.Run(&client.Call{
+		Args:  createPutRequest(proto.Key("a"), []byte("value"), txn),
+		Reply: &proto.PutResponse{}}); err != nil {
 		t.Fatal(err)
 	}
 
