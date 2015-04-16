@@ -342,7 +342,7 @@ func NewStore(clock *hlc.Clock, eng engine.Engine, db *client.KV, gossip *gossip
 	}
 
 	// Add range scanner and configure with queues.
-	s.scanner = newRangeScanner(defaultScanInterval, newStoreRangeIterator(s))
+	s.scanner = newRangeScanner(defaultScanInterval, newStoreRangeIterator(s), s)
 	s.gcQueue = newGCQueue()
 	s.splitQueue = newSplitQueue(db, gossip)
 	s.verifyQueue = newVerifyQueue(s.scanner.Stats)
@@ -843,6 +843,9 @@ func (s *Store) AddRange(rng *Range) error {
 	if err := s.multiraft.CreateGroup(uint64(rng.Desc().RaftID)); err != nil {
 		return err
 	}
+	if err := s.updateStoreStatus(); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -888,6 +891,9 @@ func (s *Store) RemoveRange(rng *Range) error {
 		return util.Errorf("couldn't find range in rangesByKey slice")
 	}
 	s.rangesByKey = append(s.rangesByKey[:n], s.rangesByKey[n+1:]...)
+	if err := s.updateStoreStatus(); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -1267,11 +1273,9 @@ func raftEntryFormatter(data []byte) string {
 func (s *Store) updateStoreStatus() error {
 	now := s.clock.Now().WallTime
 	s.status.UpdatedAt = now
-	s.status.RaftIDs = []int64{}
-	for raftID := range s.ranges {
-		s.status.RaftIDs = append(s.status.RaftIDs, raftID)
-	}
+	s.status.RangeCount = int32(len(s.ranges))
 	key := engine.StoreStatusKey(int32(s.Ident.StoreID))
+	s.status.Stats = proto.MVCCStats(s.scanner.Stats().MVCC)
 	if err := engine.MVCCPutProto(s.engine, nil, key, proto.ZeroTimestamp, nil, s.status); err != nil {
 		return err
 	}

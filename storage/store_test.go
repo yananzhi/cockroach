@@ -157,13 +157,12 @@ func TestStoreInitAndBootstrap(t *testing.T) {
 
 	// Make sure the store status exists and is correct.
 	expectedStoreStatus := &proto.StoreStatus{
-		StoreID:   1,
-		NodeID:    1,
-		RaftIDs:   []int64{1},
-		UpdatedAt: 0,
-		StartedAt: 0,
-		UsedBytes: 0,
-		MaxBytes:  0,
+		StoreID:    1,
+		NodeID:     1,
+		RangeCount: 1,
+		StartedAt:  0,
+		UpdatedAt:  0,
+		Stats:      proto.MVCCStats{},
 	}
 	storeStatusKey := engine.StoreStatusKey(int32(store.Ident.StoreID))
 	gArgs, gReply := getArgs(storeStatusKey, 1, store.StoreID())

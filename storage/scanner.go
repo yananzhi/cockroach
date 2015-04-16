@@ -71,6 +71,7 @@ type storeStats struct {
 // complete approximately one full scan per interval. Each range is
 // tested for inclusion in a sequence of prioritized range queues.
 type rangeScanner struct {
+	store    *Store         // The store this scanner is being called from
 	interval time.Duration  // Duration interval for scan loop
 	iter     rangeIterator  // Iterator to implement scan of ranges
 	queues   []rangeQueue   // Range queues managed by this scanner
@@ -79,10 +80,12 @@ type rangeScanner struct {
 	stats    unsafe.Pointer // Latest store stats object; updated atomically
 }
 
-// newRangeScanner creates a new range scanner with the provided
-// loop interval, range iterator, and range queues.
-func newRangeScanner(interval time.Duration, iter rangeIterator) *rangeScanner {
+// newRangeScanner creates a new range scanner with the provided loop interval,
+// range iterator, and range queues.  If store is not nil, after a complete
+// loop the store's status will be updated and written to the db.
+func newRangeScanner(interval time.Duration, iter rangeIterator, store *Store) *rangeScanner {
 	return &rangeScanner{
+		store:    store,
 		interval: interval,
 		iter:     iter,
 		removed:  make(chan *Range, 10),
@@ -167,6 +170,9 @@ func (rs *rangeScanner) scanLoop(clock *hlc.Clock, stopper *util.Stopper) {
 					// Store the most recent scan results in the scanner's stats.
 					atomic.StorePointer(&rs.stats, unsafe.Pointer(stats))
 					stats = &storeStats{}
+					if rs.store != nil {
+						rs.store.updateStoreStatus()
+					}
 					log.V(6).Infof("reset range scan iteration")
 				}
 				stopper.FinishTask()
