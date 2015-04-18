@@ -164,8 +164,8 @@ func TestClientNotReady(t *testing.T) {
 	opts := Options{
 		N:               1,
 		Ordering:        OrderStable,
-		SendNextTimeout: 1 * time.Second,
-		Timeout:         1 * time.Second,
+		SendNextTimeout: 1 * time.Nanosecond,
+		Timeout:         1 * time.Nanosecond,
 	}
 	// Send RPC to an address where no server is running.
 	_, err := sendPing(opts, []net.Addr{util.CreateTestAddr("tcp")}, rpcContext)
@@ -178,6 +178,20 @@ func TestClientNotReady(t *testing.T) {
 	}
 	if !retryErr.CanRetry() {
 		t.Errorf("Expected retryable error: %v", retryErr)
+	}
+
+	// Send the RPC again with no timeout.
+	opts.SendNextTimeout = 0 * time.Nanosecond
+	opts.Timeout = 0 * time.Nanosecond
+	c := make(chan interface{})
+	go func() {
+		sendPing(opts, []net.Addr{util.CreateTestAddr("tcp")}, rpcContext)
+		close(c)
+	}()
+	select {
+	case <-c:
+		t.Fatalf("Unexpected rpc success")
+	case <-time.After(1 * time.Millisecond):
 	}
 }
 

@@ -20,6 +20,7 @@ package rpc
 import (
 	"fmt"
 	"io"
+	"math"
 	"math/rand"
 	"net"
 	"net/rpc"
@@ -208,12 +209,14 @@ func Send(opts Options, method string, addrs []net.Addr, getArgs func(addr net.A
 // client is ready. On success, the reply is sent on the channel;
 // otherwise an error is sent.
 func sendOne(client *Client, timeout time.Duration, method string, args, reply interface{}, c chan interface{}) {
+	if timeout == 0 {
+		// Wait forever.
+		timeout = math.MaxInt64
+	}
 	select {
 	case <-client.Ready:
-		break
 	case <-time.After(timeout):
-		c <- rpcError{fmt.Sprintf("rpc to %s timed out after %s as the client didn't become ready",
-			method, timeout)}
+		c <- rpcError{fmt.Sprintf("rpc to %s: client not ready after %s", method, timeout)}
 		return
 	}
 	call := client.Go(method, args, reply, nil)
