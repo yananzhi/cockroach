@@ -1647,8 +1647,11 @@ func (r *Range) InitialState() (raftpb.HardState, raftpb.ConfState, error) {
 	}
 
 	var cs raftpb.ConfState
-	for _, rep := range r.Desc().Replicas {
-		cs.Nodes = append(cs.Nodes, uint64(MakeRaftNodeID(rep.NodeID, rep.StoreID)))
+	// For uninitalized ranges, membership is unknown at this point.
+	if found || r.isInitialized() {
+		for _, rep := range r.Desc().Replicas {
+			cs.Nodes = append(cs.Nodes, uint64(MakeRaftNodeID(rep.NodeID, rep.StoreID)))
+		}
 	}
 
 	return hs, cs, nil
