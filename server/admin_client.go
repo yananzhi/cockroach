@@ -27,8 +27,12 @@ import (
 
 // sendAdminRequest send an HTTP request and processes the response for
 // its body or error message if a non-200 response code.
-func sendAdminRequest(req *http.Request) ([]byte, error) {
-	resp, err := http.DefaultClient.Do(req)
+func sendAdminRequest(ctx *Context, req *http.Request) ([]byte, error) {
+	client, err := ctx.GetHTTPClient()
+	if err != nil {
+		return nil, util.Errorf("failed to initialized http client: %s", err)
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, util.Errorf("admin REST request failed: %s", err)
 	}
@@ -45,11 +49,11 @@ func sendAdminRequest(req *http.Request) ([]byte, error) {
 
 // SendQuit requests the admin quit path to drain and shutdown the server.
 func SendQuit(ctx *Context) error {
-	req, err := http.NewRequest("GET", fmt.Sprintf("%s://%s%s", adminScheme, ctx.Addr, quitPath), nil)
+	req, err := http.NewRequest("GET", fmt.Sprintf("%s://%s%s", ctx.RequestScheme(), ctx.Addr, quitPath), nil)
 	if err != nil {
 		return util.Errorf("unable to create request to admin REST endpoint: %s", err)
 	}
-	b, err := sendAdminRequest(req)
+	b, err := sendAdminRequest(ctx, req)
 	if err != nil {
 		return util.Errorf("admin REST request failed: %s", err)
 	}

@@ -40,6 +40,7 @@ import (
 	"github.com/cockroachdb/cockroach/util/hlc"
 	"github.com/cockroachdb/cockroach/util/log"
 	assetfs "github.com/elazarl/go-bindata-assetfs"
+	"golang.org/x/net/context"
 )
 
 var (
@@ -81,13 +82,12 @@ func NewServer(ctx *Context, stopper *util.Stopper) (*Server, error) {
 		return nil, util.Errorf("unable to resolve RPC address %q: %v", addr, err)
 	}
 
-	var tlsConfig *rpc.TLSConfig
-	if ctx.Certs == "" {
-		tlsConfig = rpc.LoadInsecureTLSConfig()
-	} else {
-		if tlsConfig, err = rpc.LoadTLSConfigFromDir(ctx.Certs); err != nil {
-			return nil, util.Errorf("unable to load TLS config: %v", err)
-		}
+	if ctx.Insecure {
+		log.Warning("running in insecure mode, this is strongly discouraged. See -insecure and -certs.")
+	}
+	tlsConfig, err := ctx.GetServerTLSConfig()
+	if err != nil {
+		return nil, err
 	}
 
 	s := &Server{
@@ -98,7 +98,7 @@ func NewServer(ctx *Context, stopper *util.Stopper) (*Server, error) {
 	}
 	s.clock.SetMaxOffset(ctx.MaxOffset)
 
-	rpcContext := rpc.NewContext(s.clock, tlsConfig)
+	rpcContext := rpc.NewContext(s.clock, tlsConfig, stopper)
 	go rpcContext.RemoteClocks.MonitorRemoteOffsets()
 
 	s.rpc = rpc.NewServer(util.MakeRawAddr("tcp", addr), rpcContext)
@@ -117,9 +117,20 @@ func NewServer(ctx *Context, stopper *util.Stopper) (*Server, error) {
 	s.stopper.AddCloser(s.raftTransport)
 
 	s.kvDB = kv.NewDBServer(sender)
+	if s.ctx.ExperimentalRPCServer {
+		s.kvDB.RegisterRPC(s.rpc)
+	}
 	s.kvREST = kv.NewRESTServer(s.kv)
 	// TODO(bdarnell): make StoreConfig configurable.
-	s.node = NewNode(s.kv, s.gossip, storage.StoreConfig{}, s.raftTransport)
+	nCtx := storage.StoreContext{
+		Clock:        s.clock,
+		DB:           s.kv,
+		Gossip:       s.gossip,
+		Transport:    s.raftTransport,
+		Context:      context.Background(),
+		ScanInterval: s.ctx.ScanInterval,
+	}
+	s.node = NewNode(nCtx)
 	s.admin = newAdminServer(s.kv, s.stopper)
 	s.status = newStatusServer(s.kv, s.gossip)
 	s.structuredDB = structured.NewDB(s.kv)
@@ -142,15 +153,15 @@ func (s *Server) Start(selfBootstrap bool) error {
 		if err != nil {
 			return err
 		}
-		s.gossip.SetResolvers([]*gossip.Resolver{selfResolver})
+		s.gossip.SetResolvers([]gossip.Resolver{selfResolver})
 	}
 	s.gossip.Start(s.rpc, s.stopper)
 
-	if err := s.node.start(s.rpc, s.clock, s.ctx.Engines, s.ctx.NodeAttributes, s.stopper); err != nil {
+	if err := s.node.start(s.rpc, s.ctx.Engines, s.ctx.NodeAttributes, s.stopper); err != nil {
 		return err
 	}
 
-	log.Infof("starting http server at %s", s.rpc.Addr())
+	log.Infof("starting %s server at %s", s.ctx.RequestScheme(), s.rpc.Addr())
 	// TODO(spencer): go1.5 is supposed to allow shutdown of running http server.
 	s.initHTTP()
 	s.rpc.Serve(s)

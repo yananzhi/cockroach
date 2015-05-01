@@ -18,42 +18,71 @@
 package server
 
 import (
-	"time"
+	"testing"
 
 	"github.com/cockroachdb/cockroach/gossip"
 	"github.com/cockroachdb/cockroach/proto"
+	"github.com/cockroachdb/cockroach/security"
 	"github.com/cockroachdb/cockroach/storage"
 	"github.com/cockroachdb/cockroach/storage/engine"
 	"github.com/cockroachdb/cockroach/util"
 	"github.com/cockroachdb/cockroach/util/hlc"
+	"github.com/cockroachdb/cockroach/util/log"
 )
+
+// StartTestServer starts a in-memory test server.
+func StartTestServer(t testing.TB) *TestServer {
+	s := &TestServer{}
+	if err := s.Start(); err != nil {
+		if t != nil {
+			t.Fatalf("Could not start server: %v", err)
+		} else {
+			log.Fatalf("Could not start server: %v", err)
+		}
+	}
+	log.Infof("Test server listening on %s: %s", s.Ctx.RequestScheme(), s.ServingAddr())
+	return s
+}
+
+// NewTestContext returns a context for testing. It overrides the
+// Certs with the test certs directory.
+// We need to override the certs loader.
+func NewTestContext() *Context {
+	ctx := NewContext()
+
+	// MaxOffset is the maximum offset for clocks in the cluster.
+	// This is mostly irrelevant except when testing reads within
+	// uncertainty intervals.
+	ctx.MaxOffset = 0
+
+	// Load test certs. In addition, the tests requiring certs
+	// need to call security.SetReadFileFn(securitytest.Asset)
+	// in their init to mock out the file system calls for calls to AssetFS,
+	// which has the test certs compiled in. Typically this is done
+	// once per package, in main_test.go.
+	ctx.Certs = security.EmbeddedCertsDir
+	// Addr defaults to localhost with port set at time of call to
+	// Start() to an available port.
+	// Call TestServer.ServingAddr() for the full address (including bound port).
+	ctx.Addr = "127.0.0.1:0"
+	return ctx
+}
 
 // A TestServer encapsulates an in-memory instantiation of a cockroach
 // node with a single store. Example usage of a TestServer follows:
 //
-//   s := &server.TestServer{}
-//   if err := s.Start(); err != nil {
-//     t.Fatal(err)
-//   }
+//   s := server.StartTestServer(t)
 //   defer s.Stop()
 //
-// TODO(spencer): add support for multiple stores.
 type TestServer struct {
-	// CertDir specifies the directory containing certs for SSL
-	// connections. Default will load insecure TLS config.
-	CertDir string
-	// MaxOffset is the maximum offset for clocks in the cluster.
-	// This is mostly irrelevant except when testing reads within
-	// uncertainty intervals.
-	MaxOffset time.Duration
-	// Addr defaults to localhost with port set at time of call to
-	// Start() to an available port.
-	Addr          string
+	// Ctx is the context used by this server.
+	Ctx           *Context
 	SkipBootstrap bool
 	// server is the embedded Cockroach server struct.
 	*Server
-	// Engine underlying the test server.
-	Engine engine.Engine
+	StoresPerNode int
+	// Engines underlying the test server.
+	Engines []engine.Engine
 }
 
 // Gossip returns the gossip instance used by the TestServer.
@@ -75,33 +104,40 @@ func (ts *TestServer) Clock() *hlc.Clock {
 // Start starts the TestServer by bootstrapping an in-memory store
 // (defaults to maximum of 100M). The server is started, launching the
 // node RPC server and all HTTP endpoints. Use the value of
-// TestServer.Addr after Start() for client connections. Use Stop()
+// TestServer.ServingAddr() after Start() for client connections. Use Stop()
 // to shutdown the server after the test completes.
 func (ts *TestServer) Start() error {
-	// We update these with the actual port once the servers
-	// have been launched for the purpose of this test.
-	if ts.Addr == "" {
-		ts.Addr = "127.0.0.1:0"
+	if ts.Ctx == nil {
+		ts.Ctx = NewTestContext()
 	}
-
-	ctx := NewContext()
-	ctx.Addr = ts.Addr
-	ctx.Certs = ts.CertDir
-	ctx.MaxOffset = ts.MaxOffset
 
 	var err error
-	ts.Server, err = NewServer(ctx, util.NewStopper())
+	ts.Server, err = NewServer(ts.Ctx, util.NewStopper())
 	if err != nil {
-		return util.Errorf("could not init server: %s", err)
+		return err
 	}
 
-	if ts.Engine == nil {
-		ts.Engine = engine.NewInMem(proto.Attributes{}, 100<<20)
+	// Ensure we have the correct number of engines. Add in in-memory ones where
+	// needed.  There must be at least one store/engine.
+	if ts.StoresPerNode < 1 {
+		ts.StoresPerNode = 1
 	}
-	ctx.Engines = []engine.Engine{ts.Engine}
+	if ts.Engines == nil {
+		ts.Engines = []engine.Engine{}
+	}
+	for i := 0; i < ts.StoresPerNode; i++ {
+		if len(ts.Engines) < i+1 {
+			ts.Engines = append(ts.Engines, nil)
+		}
+		if ts.Engines[i] == nil {
+			ts.Engines[i] = engine.NewInMem(proto.Attributes{}, 100<<20)
+		}
+	}
+	ts.Ctx.Engines = ts.Engines
+
 	if !ts.SkipBootstrap {
 		stopper := util.NewStopper()
-		_, err := BootstrapCluster("cluster-1", ts.Engine, stopper)
+		_, err := BootstrapCluster("cluster-1", ts.Ctx.Engines, stopper)
 		if err != nil {
 			return util.Errorf("could not bootstrap cluster: %s", err)
 		}
@@ -109,13 +145,15 @@ func (ts *TestServer) Start() error {
 	}
 	err = ts.Server.Start(true)
 	if err != nil {
-		return util.Errorf("could not start server: %s", err)
+		return err
 	}
-	// Update the configuration variables to reflect the actual
-	// ports bound.
-	ts.Addr = ts.rpc.Addr().String()
 
 	return nil
+}
+
+// ServingAddr returns the rpc server's address. Should be used by clients.
+func (ts *TestServer) ServingAddr() string {
+	return ts.rpc.Addr().String()
 }
 
 // Stop stops the TestServer.
@@ -126,7 +164,7 @@ func (ts *TestServer) Stop() {
 // SetRangeRetryOptions sets the retry options for stores in TestServer.
 func (ts *TestServer) SetRangeRetryOptions(ro util.RetryOptions) {
 	ts.node.lSender.VisitStores(func(s *storage.Store) error {
-		s.RetryOpts = ro
+		s.SetRangeRetryOptions(ro)
 		return nil
 	})
 }

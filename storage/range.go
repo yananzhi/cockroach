@@ -28,6 +28,7 @@ import (
 	"reflect"
 	"sync"
 	"sync/atomic"
+	"testing"
 	"time"
 	"unsafe"
 
@@ -37,24 +38,20 @@ import (
 	"github.com/cockroachdb/cockroach/proto"
 	"github.com/cockroachdb/cockroach/storage/engine"
 	"github.com/cockroachdb/cockroach/util"
-	"github.com/cockroachdb/cockroach/util/encoding"
 	"github.com/cockroachdb/cockroach/util/hlc"
 	"github.com/cockroachdb/cockroach/util/log"
-	"github.com/coreos/etcd/raft"
-	"github.com/coreos/etcd/raft/raftpb"
 	gogoproto "github.com/gogo/protobuf/proto"
 )
 
 // init pre-registers RangeDescriptor, PrefixConfigMap types and Transaction.
 func init() {
-	gob.Register(StoreDescriptor{})
+	gob.Register(proto.StoreDescriptor{})
 	gob.Register(PrefixConfigMap{})
 	gob.Register(&proto.AcctConfig{})
 	gob.Register(&proto.PermConfig{})
 	gob.Register(&proto.ZoneConfig{})
 	gob.Register(proto.RangeDescriptor{})
 	gob.Register(proto.Transaction{})
-	gob.Register(&NodeDescriptor{})
 }
 
 var (
@@ -82,7 +79,7 @@ var (
 // consistent results each time. Should only be used in tests in the
 // storage package but needs to be exported due to circular import
 // issues.
-var TestingCommandFilter func(string, proto.Request, proto.Response) bool
+var TestingCommandFilter func(proto.Request, proto.Response) bool
 
 // raftInitialLogIndex is the starting point for the raft log. We bootstrap
 // the raft membership by synthesizing a snapshot as if there were some
@@ -112,27 +109,26 @@ var configDescriptors = []*configDescriptor{
 
 // tsCacheMethods specifies the set of methods which affect the
 // timestamp cache.
-var tsCacheMethods = map[string]struct{}{
-	proto.Contains:              {},
-	proto.Get:                   {},
-	proto.Put:                   {},
-	proto.ConditionalPut:        {},
-	proto.Increment:             {},
-	proto.Scan:                  {},
-	proto.Delete:                {},
-	proto.DeleteRange:           {},
-	proto.ReapQueue:             {},
-	proto.EnqueueUpdate:         {},
-	proto.EnqueueMessage:        {},
-	proto.InternalResolveIntent: {},
-	proto.InternalMerge:         {},
+var tsCacheMethods = [...]bool{
+	proto.Contains:              true,
+	proto.Get:                   true,
+	proto.Put:                   true,
+	proto.ConditionalPut:        true,
+	proto.Increment:             true,
+	proto.Scan:                  true,
+	proto.Delete:                true,
+	proto.DeleteRange:           true,
+	proto.InternalResolveIntent: true,
 }
 
-// UsesTimestampCache returns true if the method affects or is
+// usesTimestampCache returns true if the request affects or is
 // affected by the timestamp cache.
-func UsesTimestampCache(method string) bool {
-	_, ok := tsCacheMethods[method]
-	return ok
+func usesTimestampCache(r proto.Request) bool {
+	m := r.Method()
+	if m < 0 || m >= proto.Method(len(tsCacheMethods)) {
+		return false
+	}
+	return tsCacheMethods[m]
 }
 
 // A pendingCmd holds the reply buffer and a done channel for a command
@@ -156,16 +152,31 @@ type RangeManager interface {
 	Allocator() *allocator
 	Gossip() *gossip.Gossip
 	SplitQueue() *splitQueue
+	Stopper() *util.Stopper
+	EventFeed() StoreEventFeed
 
 	// Range manipulation methods.
 	AddRange(rng *Range) error
 	LookupRange(start, end proto.Key) *Range
-	MergeRange(subsumingRng *Range, updatedEndKey proto.Key, subsumedRaftID int64) (*Range, error)
+	MergeRange(subsumingRng *Range, updatedEndKey proto.Key, subsumedRaftID int64) error
 	NewRangeDescriptor(start, end proto.Key, replicas []proto.Replica) (*proto.RangeDescriptor, error)
 	NewSnapshot() engine.Engine
 	ProposeRaftCommand(cmdIDKey, proto.InternalRaftCommand) <-chan error
 	RemoveRange(rng *Range) error
 	SplitRange(origRng, newRng *Range) error
+}
+
+// a leaseRejectedError is returned if a lease request is denied due to
+// illegal overlap with the previous lease.
+type leaseRejectedError struct {
+	EffectiveStart   proto.Timestamp
+	PrevLease, Lease proto.Lease
+}
+
+func (l *leaseRejectedError) Error() string {
+	nodeID, storeID := DecodeRaftNodeID(multiraft.NodeID(l.Lease.RaftNodeID))
+	return fmt.Sprintf("node %d, store %d: previous lease %s overlaps %s (effective %s)",
+		nodeID, storeID, l.PrevLease, l.Lease, l.EffectiveStart)
 }
 
 // A Range is a contiguous keyspace with writes managed via an
@@ -186,17 +197,15 @@ type Range struct {
 	lastIndex uint64
 	// Last index applied to the state machine. Updated atomically.
 	appliedIndex uint64
-	lease        unsafe.Pointer // Information for leader lease
-	stopper      *util.Stopper
+	lease        unsafe.Pointer // Information for leader lease, updated atomically
+	llMu         sync.Mutex     // Synchronizes readers' requests for leader lease
 
-	sync.RWMutex                 // Protects the following fields (and Desc)
+	sync.RWMutex                 // Protects the following fields:
 	cmdQ         *CommandQueue   // Enforce at most one command is running per key(s)
 	tsCache      *TimestampCache // Most recent timestamps for keys / key ranges
 	respCache    *ResponseCache  // Provides idempotence for retries
 	pendingCmds  map[cmdIDKey]*pendingCmd
 }
-
-var _ multiraft.WriteableGroupStorage = &Range{}
 
 // NewRange initializes the range using the given metadata.
 func NewRange(desc *proto.RangeDescriptor, rm RangeManager) (*Range, error) {
@@ -209,16 +218,23 @@ func NewRange(desc *proto.RangeDescriptor, rm RangeManager) (*Range, error) {
 	}
 	r.SetDesc(desc)
 
-	err := r.loadLastIndex()
+	lastIndex, err := r.loadLastIndex()
 	if err != nil {
 		return nil, err
 	}
+	atomic.StoreUint64(&r.lastIndex, lastIndex)
 
-	appliedIndex, err := loadAppliedIndex(r.rm.Engine(), desc.RaftID)
+	appliedIndex, err := r.loadAppliedIndex(r.rm.Engine())
 	if err != nil {
 		return nil, err
 	}
 	atomic.StoreUint64(&r.appliedIndex, appliedIndex)
+
+	lease, err := loadLeaderLease(r.rm.Engine(), desc.RaftID)
+	if err != nil {
+		return nil, err
+	}
+	atomic.StorePointer(&r.lease, unsafe.Pointer(lease))
 
 	if r.stats, err = newRangeStats(desc.RaftID, rm.Engine()); err != nil {
 		return nil, err
@@ -232,32 +248,50 @@ func (r *Range) String() string {
 	return fmt.Sprintf("range=%d (%s-%s)", r.Desc().RaftID, r.Desc().StartKey, r.Desc().EndKey)
 }
 
-// start begins gossiping loop in the event this is the first
-// range in the map and gossips config information if the range
-// contains any of the configuration maps.
-func (r *Range) start(stopper *util.Stopper) {
-	r.stopper = stopper
-	// TODO(spencer): gossiping should only commence when the range gains
-	// the leader lease and it should stop when the range no longer holds
-	// the leader lease.
-	r.maybeGossipClusterID()
-	r.maybeGossipFirstRange()
-	r.maybeGossipConfigs(configDescriptors...)
-	// Only start gossiping if this range is the first range.
-	if r.IsFirstRange() {
-		r.startGossip()
+// start begins by gossiping the configs. It also gossips the sentinel if we're
+// the first range (the store will do this regularly, but this is a good time
+// to get started quickly).
+func (r *Range) start() {
+	// Being the first range comes with extra responsibility for the gossip
+	// sentinel and first range metadata.
+	// TODO(tschottdorf) really want something more streamlined, such as:
+	//
+	// if r.rm.Stopper().StartTask() {
+	// 	go func() {
+	// 		r.maybeGossipFirstRangeWithLease()
+	// 		r.rm.Stopper().FinishTask()
+	// 	}()
+	// }
+	//
+	// but
+	// a) in some tests that goroutine gets stuck acquiring the lease, probably
+	//    due to Raft losing the command
+	// b) other times, the lease fails because the MultiRaft group doesn't exist
+	//    yet
+	// b) it complicates testing because there's little way of knowing who
+	//    will get the lease first, and many tests are too low level to do
+	//    the appropriate retries.
+	//
+	// Instead we do this for now:
+	if desc := r.Desc(); desc != nil && len(desc.Replicas) == 1 && r.IsFirstRange() {
+		r.gossipFirstRange()
 	}
+
+	r.maybeGossipConfigs(func(configPrefix proto.Key) bool {
+		return r.ContainsKey(configPrefix)
+	})
 }
 
 // Destroy cleans up all data associated with this range.
 func (r *Range) Destroy() error {
-	var deletes []interface{}
 	iter := newRangeDataIterator(r, r.rm.Engine())
 	defer iter.Close()
+	batch := r.rm.Engine().NewBatch()
+	defer batch.Close()
 	for ; iter.Valid(); iter.Next() {
-		deletes = append(deletes, engine.BatchDelete{RawKeyValue: proto.RawKeyValue{Key: iter.Key()}})
+		_ = batch.Clear(iter.Key())
 	}
-	return r.rm.Engine().WriteBatch(deletes)
+	return batch.Commit()
 }
 
 // GetMaxBytes atomically gets the range maximum byte limit.
@@ -276,42 +310,124 @@ func (r *Range) IsFirstRange() bool {
 	return bytes.Equal(r.Desc().StartKey, engine.KeyMin)
 }
 
-// IsLeader returns true if this range replica is the raft leader.
-// TODO(spencer): this is always true for now.
-func (r *Range) IsLeader() bool {
-	return true
+func loadLeaderLease(eng engine.Engine, raftID int64) (*proto.Lease, error) {
+	lease := &proto.Lease{}
+	if _, err := engine.MVCCGetProto(eng, engine.RaftLeaderLeaseKey(raftID), proto.ZeroTimestamp, true, nil, lease); err != nil {
+		return nil, err
+	}
+	return lease, nil
 }
 
-func (r *Range) setLease(l *proto.Lease) {
-	atomic.StorePointer(&r.lease, unsafe.Pointer(l))
-}
-
+// getLease returns the current leader lease.
 func (r *Range) getLease() *proto.Lease {
 	return (*proto.Lease)(atomic.LoadPointer(&r.lease))
 }
 
-// canServiceCmd returns an error in the event that the range replica
-// cannot service the command as specified. This is of the case in
-// the event that the replica is not the leader.
-func (r *Range) canServiceCmd(method string, args proto.Request) error {
-	header := args.Header()
-	if !r.IsLeader() {
-		if !proto.IsReadOnly(method) || header.ReadConsistency == proto.CONSISTENT {
-			// TODO(spencer): when we happen to know the leader, fill it in here via replica.
-			return &proto.NotLeaderError{}
-		}
+// newNotLeaderError returns a NotLeaderError intialized with the
+// replica for the last known holder of the leader lease.
+func (r *Range) newNotLeaderError() error {
+	err := &proto.NotLeaderError{}
+	if l := r.getLease(); l.RaftNodeID != 0 {
+		_, err.Replica = r.Desc().FindReplica(r.rm.StoreID())
+		_, storeID := DecodeRaftNodeID(multiraft.NodeID(l.RaftNodeID))
+		_, err.Leader = r.Desc().FindReplica(storeID)
 	}
-	if proto.IsReadOnly(method) {
-		if header.ReadConsistency == proto.CONSENSUS {
-			return util.Errorf("consensus reads not implemented")
-		} else if header.ReadConsistency == proto.INCONSISTENT && header.Txn != nil {
-			return util.Errorf("cannot allow inconsistent reads within a transaction")
-		}
+	return err
+}
+
+// requestLeaderLease sends a request to obtain or extend a leader lease for
+// this replica. Unless an error is returned, the obtained lease will be valid
+// for a time interval containing the requested timestamp.
+func (r *Range) requestLeaderLease(timestamp proto.Timestamp) error {
+	// TODO(Tobias): get duration from configuration, either as a config flag
+	// or, later, dynamically adjusted.
+	duration := int64(defaultLeaderLeaseDuration)
+	// Prepare a Raft command to get a leader lease for this replica.
+	expiration := timestamp.Add(duration, 0)
+	args := &proto.InternalLeaderLeaseRequest{
+		RequestHeader: proto.RequestHeader{
+			Key:       r.Desc().StartKey,
+			Timestamp: timestamp,
+			CmdID: proto.ClientCmdID{
+				WallTime: r.rm.Clock().Now().WallTime,
+				Random:   rand.Int63(),
+			},
+		},
+		Lease: proto.Lease{
+			Start:      timestamp,
+			Expiration: expiration,
+			RaftNodeID: uint64(r.rm.RaftNodeID()),
+		},
 	}
-	if !r.ContainsKeyRange(header.Key, header.EndKey) {
-		return proto.NewRangeKeyMismatchError(header.Key, header.EndKey, r.Desc())
+	// Send lease request directly to raft in order to skip unnecessary
+	// checks from normal request machinery, (e.g. the command queue).
+	errChan, pendingCmd := r.proposeRaftCommand(args, &proto.InternalLeaderLeaseResponse{})
+	var err error
+	if err = <-errChan; err == nil {
+		// Next if the command was committed, wait for the range to apply it.
+		err = <-pendingCmd.done
+	}
+	return err
+}
+
+// redirectOnOrAcquireLeaderLease checks whether this replica has the
+// leader lease at the specified timestamp. If it does, returns
+// success. If another replica currently holds the lease, redirects by
+// returning NotLeaderError. If the lease is expired, a renewal is
+// synchronously requested. This method uses the leader lease mutex
+// to guarantee only one request to grant the lease is pending.
+//
+// TODO(spencer): implement threshold regrants to avoid latency in
+//  the presence of read or write pressure sufficiently close to the
+//  current lease's expiration.
+//
+// TODO(spencer): for write commands, don't wait while requesting
+//  the leader lease. If the lease acquisition fails, the write cmd
+//  will fail as well. If it succeeds, as is likely, then the write
+//  will not incur latency waiting for the command to complete.
+//  Reads, however, must wait.
+func (r *Range) redirectOnOrAcquireLeaderLease(timestamp proto.Timestamp) error {
+	r.llMu.Lock()
+	defer r.llMu.Unlock()
+	// If lease is currently held by another, redirect to holder.
+	if held, expired := r.HasLeaderLease(timestamp); !held && !expired {
+		return r.newNotLeaderError()
+	} else if !held || expired {
+		// Otherwise, if not held by this replica or expired, request renewal.
+		if err := r.requestLeaderLease(timestamp); err != nil {
+			return err
+		}
 	}
 	return nil
+}
+
+// verifyLeaderLease checks whether the requesting replica (by raft
+// node ID) holds the leader lease covering the specified timestamp.
+func (r *Range) verifyLeaderLease(originRaftNodeID multiraft.NodeID, timestamp proto.Timestamp) bool {
+	l := r.getLease()
+	return uint64(originRaftNodeID) == l.RaftNodeID && timestamp.Less(l.Expiration)
+}
+
+// HasLeaderLease returns whether this replica holds or was the last
+// holder of the leader lease, and whether the lease has expired.
+// Leases may not overlap, and a gap between successive lease holders
+// is expected.
+func (r *Range) HasLeaderLease(timestamp proto.Timestamp) (bool, bool) {
+	if l := r.getLease(); l.RaftNodeID != 0 {
+		held := l.RaftNodeID == uint64(r.rm.RaftNodeID())
+		expired := !timestamp.Less(l.Expiration)
+		return held, expired
+	}
+	// The lease has never been held.
+	return false, true
+}
+
+// WaitForLeaderLease is used from unittests to wait until this range
+// has the leader lease.
+func (r *Range) WaitForLeaderLease(t *testing.T) {
+	util.SucceedsWithin(t, 1*time.Second, func() error {
+		return r.requestLeaderLease(r.rm.Clock().Now())
+	})
 }
 
 // isInitialized is true if we know the metadata of this range, either
@@ -342,6 +458,11 @@ func (r *Range) GetReplica() *proto.Replica {
 		log.Fatalf("own replica missing in range at store %d", r.rm.StoreID())
 	}
 	return replica
+}
+
+// GetMVCCStats returns a copy of the MVCC stats object for this range.
+func (r *Range) GetMVCCStats() proto.MVCCStats {
+	return r.stats.GetMVCC()
 }
 
 // ContainsKey returns whether this range contains the specified key.
@@ -393,19 +514,14 @@ func (r *Range) SetLastVerificationTimestamp(timestamp proto.Timestamp) error {
 // either along the read-only execution path or the read-write Raft
 // command queue. If wait is false, read-write commands are added to
 // Raft without waiting for their completion.
-func (r *Range) AddCmd(method string, args proto.Request, reply proto.Response, wait bool) error {
-	if err := r.canServiceCmd(method, args); err != nil {
-		reply.Header().SetGoError(err)
-		return err
+func (r *Range) AddCmd(args proto.Request, reply proto.Response, wait bool) error {
+	// Differentiate between admin, read-only and read-write.
+	if proto.IsAdmin(args) {
+		return r.addAdminCmd(args, reply)
+	} else if proto.IsReadOnly(args) {
+		return r.addReadOnlyCmd(args, reply)
 	}
-
-	// Differentiate between read-only and read-write.
-	if proto.IsAdmin(method) {
-		return r.addAdminCmd(method, args, reply)
-	} else if proto.IsReadOnly(method) {
-		return r.addReadOnlyCmd(method, args, reply)
-	}
-	return r.addReadWriteCmd(method, args, reply, wait)
+	return r.addReadWriteCmd(args, reply, wait)
 }
 
 // beginCmd waits for any overlapping, already-executing commands via
@@ -413,28 +529,53 @@ func (r *Range) AddCmd(method string, args proto.Request, reply proto.Response, 
 // commands which overlap its key range. This method will block if
 // there are any overlapping commands already in the queue. Returns
 // the command queue insertion key, to be supplied to subsequent
-// invocation of cmdQ.Remove().
-func (r *Range) beginCmd(start, end proto.Key, readOnly bool) interface{} {
+// invocation of endCmd().
+func (r *Range) beginCmd(header *proto.RequestHeader, readOnly bool) interface{} {
 	r.Lock()
 	var wg sync.WaitGroup
-	r.cmdQ.GetWait(start, end, readOnly, &wg)
-	cmdKey := r.cmdQ.Add(start, end, readOnly)
+	r.cmdQ.GetWait(header.Key, header.EndKey, readOnly, &wg)
+	cmdKey := r.cmdQ.Add(header.Key, header.EndKey, readOnly)
 	r.Unlock()
 	wg.Wait()
+	// Update the incoming timestamp if unset. Wait until after any
+	// preceding command(s) for key range are complete so that the node
+	// clock has been updated to the high water mark of any commands
+	// which might overlap this one in effect.
+	if header.Timestamp.Equal(proto.ZeroTimestamp) {
+		header.Timestamp = r.rm.Clock().Now()
+	}
 	return cmdKey
+}
+
+// endCmd removes a pending command from the command queue.
+func (r *Range) endCmd(cmdKey interface{}, args proto.Request, err error, readOnly bool) {
+	r.Lock()
+	if err == nil && usesTimestampCache(args) {
+		header := args.Header()
+		r.tsCache.Add(header.Key, header.EndKey, header.Timestamp, header.Txn.MD5(), readOnly)
+	}
+	r.cmdQ.Remove(cmdKey)
+	r.Unlock()
 }
 
 // addAdminCmd executes the command directly. There is no interaction
 // with the command queue or the timestamp cache, as admin commands
 // are not meant to consistently access or modify the underlying data.
-func (r *Range) addAdminCmd(method string, args proto.Request, reply proto.Response) error {
-	switch method {
-	case proto.AdminSplit:
+// Admin commands must run on the leader replica.
+func (r *Range) addAdminCmd(args proto.Request, reply proto.Response) error {
+	// Admin commands always require the leader lease.
+	if err := r.redirectOnOrAcquireLeaderLease(args.Header().Timestamp); err != nil {
+		reply.Header().SetGoError(err)
+		return err
+	}
+
+	switch args.(type) {
+	case *proto.AdminSplitRequest:
 		r.AdminSplit(args.(*proto.AdminSplitRequest), reply.(*proto.AdminSplitResponse))
-	case proto.AdminMerge:
+	case *proto.AdminMergeRequest:
 		r.AdminMerge(args.(*proto.AdminMergeRequest), reply.(*proto.AdminMergeResponse))
 	default:
-		return util.Errorf("unrecognized admin command type: %s", method)
+		return util.Errorf("unrecognized admin command type: %s", args.Method())
 	}
 	return reply.Header().GoError()
 }
@@ -442,62 +583,43 @@ func (r *Range) addAdminCmd(method string, args proto.Request, reply proto.Respo
 // addReadOnlyCmd updates the read timestamp cache and waits for any
 // overlapping writes currently processing through Raft ahead of us to
 // clear via the read queue.
-func (r *Range) addReadOnlyCmd(method string, args proto.Request, reply proto.Response) error {
+func (r *Range) addReadOnlyCmd(args proto.Request, reply proto.Response) error {
 	header := args.Header()
 
 	// If read-consistency is set to INCONSISTENT, run directly.
 	if header.ReadConsistency == proto.INCONSISTENT {
-		return r.executeCmd(0, method, args, reply)
+		// But disallow any inconsistent reads within txns.
+		if header.Txn != nil {
+			reply.Header().SetGoError(util.Errorf("cannot allow inconsistent reads within a transaction"))
+			return reply.Header().GoError()
+		}
+		if header.Timestamp.Equal(proto.ZeroTimestamp) {
+			header.Timestamp = r.rm.Clock().Now()
+		}
+		return r.executeCmd(r.rm.Engine(), nil, args, reply)
+	} else if header.ReadConsistency == proto.CONSENSUS {
+		reply.Header().SetGoError(util.Errorf("consensus reads not implemented"))
+		return reply.Header().GoError()
 	}
 
 	// Add the read to the command queue to gate subsequent
-	// overlapping, commands until this command completes.
-	cmdKey := r.beginCmd(header.Key, header.EndKey, true)
+	// overlapping commands until this command completes.
+	cmdKey := r.beginCmd(header, true)
 
-	// It's possible that arbitrary delays (e.g. major GC, VM
-	// de-prioritization, etc.) could cause the execution of this read
-	// command to occur AFTER the range replica has lost leadership.
-	//
-	// There is a chance that we waited on writes, and although they
-	// were committed to the log, they weren't successfully applied to
-	// this replica's state machine. We re-verify leadership before
-	// reading to make sure that all pending writes are persisted.
-	//
-	// There are some elaborate cases where we might have lost
-	// leadership and then regained it during the delay, but this is ok
-	// because any writes during that period necessarily had higher
-	// timestamps. This is because the read-timestamp-cache prevents it
-	// for the active leader and leadership changes force the
-	// read-timestamp-cache to reset its low water mark.
-	if err := r.canServiceCmd(method, args); err != nil {
+	// This replica must have leader lease to process a consistent read.
+	if err := r.redirectOnOrAcquireLeaderLease(args.Header().Timestamp); err != nil {
+		r.endCmd(cmdKey, args, err, true /* readOnly */)
+		reply.Header().SetGoError(err)
 		return err
 	}
-	err := r.executeCmd(0, method, args, reply)
+
+	// Execute read-only command.
+	err := r.executeCmd(r.rm.Engine(), nil, args, reply)
 
 	// Only update the timestamp cache if the command succeeded.
-	r.Lock()
-	if err == nil && UsesTimestampCache(method) {
-		r.tsCache.Add(header.Key, header.EndKey, header.Timestamp, header.Txn.MD5(), true /* readOnly */)
-	}
-	r.cmdQ.Remove(cmdKey)
-	r.Unlock()
+	r.endCmd(cmdKey, args, err, true /* readOnly */)
 
 	return err
-}
-
-// getCmdID will create a ClientCmdId if it's empty in Request, otherwise
-// just return it.
-func (r *Range) getCmdID(args proto.Request) (cmdID proto.ClientCmdID) {
-	if !args.Header().CmdID.IsEmpty() {
-		cmdID = args.Header().CmdID
-	} else {
-		cmdID = proto.ClientCmdID{
-			WallTime: r.rm.Clock().PhysicalNow(),
-			Random:   rand.Int63(),
-		}
-	}
-
-	return
 }
 
 // addReadWriteCmd first consults the response cache to determine whether
@@ -510,28 +632,24 @@ func (r *Range) getCmdID(args proto.Request) (cmdID proto.ClientCmdID) {
 // command is submitted to Raft. Upon completion, the write is removed
 // from the read queue and the reply is added to the response cache.
 // If wait is true, will block until the command is complete.
-func (r *Range) addReadWriteCmd(method string, args proto.Request, reply proto.Response, wait bool) error {
+func (r *Range) addReadWriteCmd(args proto.Request, reply proto.Response, wait bool) error {
 	// Check the response cache in case this is a replay. This call
 	// may block if the same command is already underway.
 	header := args.Header()
-	txnMD5 := header.Txn.MD5()
-	if ok, err := r.respCache.GetResponse(header.CmdID, reply); ok || err != nil {
-		if ok { // this is a replay! extract error for return
-			return reply.Header().GoError()
-		}
-		// In this case there was an error reading from the response
-		// cache. Instead of failing the request just because we can't
-		// decode the reply in the response cache, we proceed as though
-		// idempotence has expired.
-		log.Errorf("unable to read result for %+v from the response cache: %s", args, err)
-	}
 
 	// Add the write to the command queue to gate subsequent overlapping
-	// commands until this command completes. Note that this must be
+	// Commands until this command completes. Note that this must be
 	// done before getting the max timestamp for the key(s), as
 	// timestamp cache is only updated after preceding commands have
 	// been run to successful completion.
-	cmdKey := r.beginCmd(header.Key, header.EndKey, false)
+	cmdKey := r.beginCmd(header, false)
+
+	// This replica must have leader lease to process a write.
+	if err := r.redirectOnOrAcquireLeaderLease(args.Header().Timestamp); err != nil {
+		r.endCmd(cmdKey, args, err, false /* !readOnly */)
+		reply.Header().SetGoError(err)
+		return err
+	}
 
 	// Two important invariants of Cockroach: 1) encountering a more
 	// recently written value means transaction restart. 2) values must
@@ -541,9 +659,9 @@ func (r *Range) addReadWriteCmd(method string, args proto.Request, reply proto.R
 	// writes, send WriteTooOldError; for reads, update the write's
 	// timestamp. When the write returns, the updated timestamp will
 	// inform the final commit timestamp.
-	if UsesTimestampCache(method) {
+	if usesTimestampCache(args) {
 		r.Lock()
-		rTS, wTS := r.tsCache.GetMax(header.Key, header.EndKey, txnMD5)
+		rTS, wTS := r.tsCache.GetMax(header.Key, header.EndKey, header.Txn.MD5())
 		r.Unlock()
 
 		// Always push the timestamp forward if there's been a read which
@@ -567,53 +685,27 @@ func (r *Range) addReadWriteCmd(method string, args proto.Request, reply proto.R
 		}
 	}
 
-	// Create command and enqueue for Raft.
-	pendingCmd := &pendingCmd{
-		Reply: reply,
-		done:  make(chan error, 1),
-	}
-	raftCmd := proto.InternalRaftCommand{
-		RaftID: r.Desc().RaftID,
-	}
-	cmdID := r.getCmdID(args)
-	ok := raftCmd.Cmd.SetValue(args)
-	if !ok {
-		log.Fatalf("unknown command type %T", args)
-	}
-	idKey := makeCmdIDKey(cmdID)
-	r.Lock()
-	r.pendingCmds[idKey] = pendingCmd
-	r.Unlock()
-	// TODO(bdarnell): In certain raft failover scenarios, proposed
-	// commands may be abandoned. We need to re-propose the command
-	// if too much time passes with no response on the done channel.
-	raftChan := r.rm.ProposeRaftCommand(idKey, raftCmd)
+	errChan, pendingCmd := r.proposeRaftCommand(args, reply)
 
 	// Create a completion func for mandatory cleanups which we either
 	// run synchronously if we're waiting or in a goroutine otherwise.
 	completionFunc := func() error {
 		// First wait for raft to commit or abort the command.
 		var err error
-		if err = <-raftChan; err == nil {
-			// Next if the command was commited, wait for the range to apply it.
+		if err = <-errChan; err == nil {
+			// Next if the command was committed, wait for the range to apply it.
 			err = <-pendingCmd.done
 		}
-
 		// As for reads, update timestamp cache with the timestamp
 		// of this write on success. This ensures a strictly higher
 		// timestamp for successive writes to the same key or key range.
-		r.Lock()
-		if err == nil && UsesTimestampCache(method) {
-			r.tsCache.Add(header.Key, header.EndKey, header.Timestamp, txnMD5, false /* !readOnly */)
-		}
-		r.cmdQ.Remove(cmdKey)
-		r.Unlock()
+		r.endCmd(cmdKey, args, err, false /* !readOnly */)
 
 		// If the original client didn't wait (e.g. resolve write intent),
 		// log execution errors so they're surfaced somewhere.
 		if !wait && err != nil {
 			log.Warningf("non-synchronous execution of %s with %+v failed: %s",
-				method, args, err)
+				args.Method(), args, err)
 		}
 		return err
 	}
@@ -625,8 +717,46 @@ func (r *Range) addReadWriteCmd(method string, args proto.Request, reply proto.R
 	return nil
 }
 
-func (r *Range) processRaftCommand(idKey cmdIDKey, index uint64,
-	raftCmd proto.InternalRaftCommand) error {
+// proposeRaftCommand prepares necessary pending command struct and
+// initializes a client command ID if one hasn't been. It then
+// proposes the command to Raft and returns the error channel and
+// pending command struct for receiving.
+func (r *Range) proposeRaftCommand(args proto.Request, reply proto.Response) (<-chan error, *pendingCmd) {
+	pendingCmd := &pendingCmd{
+		Reply: reply,
+		done:  make(chan error, 1),
+	}
+	raftCmd := proto.InternalRaftCommand{
+		RaftID:       r.Desc().RaftID,
+		OriginNodeID: uint64(r.rm.RaftNodeID()),
+	}
+	cmdID := args.Header().GetOrCreateCmdID(r.rm.Clock().PhysicalNow())
+	ok := raftCmd.Cmd.SetValue(args)
+	if !ok {
+		log.Fatalf("unknown command type %T", args)
+	}
+	idKey := makeCmdIDKey(cmdID)
+	r.Lock()
+	r.pendingCmds[idKey] = pendingCmd
+	r.Unlock()
+	errChan := r.rm.ProposeRaftCommand(idKey, raftCmd)
+
+	return errChan, pendingCmd
+}
+
+// processRaftCommand processes a raft command by unpacking the command
+// struct to get args and reply and then applying the command to the
+// state machine via applyRaftCommand(). The error result is sent on
+// the command's done channel, if available.
+//
+// TODO(spencer): Differentiate between errors caused by the normal culprits --
+// bad inputs from clients, stale information, etc. and errors which might
+// cause the range replicas to diverge -- running out of disk space, underlying
+// rocksdb corruption, etc. Do a careful code audit to make sure we identify
+// errors which should be classified as a ReplicaCorruptionError--when those
+// bubble up to the point where we've just tried to execute a Raft command, the
+// Raft replica would need to stall itself.
+func (r *Range) processRaftCommand(idKey cmdIDKey, index uint64, raftCmd proto.InternalRaftCommand) error {
 	if index == 0 {
 		log.Fatal("processRaftCommand requires a non-zero index")
 	}
@@ -636,76 +766,179 @@ func (r *Range) processRaftCommand(idKey cmdIDKey, index uint64,
 	r.Unlock()
 
 	args := raftCmd.Cmd.GetValue().(proto.Request)
-	method, err := proto.MethodForRequest(args)
-	if err != nil {
-		log.Fatal(err)
-	}
-
 	var reply proto.Response
 	if cmd != nil {
 		// We initiated this command, so use the caller-supplied reply.
 		reply = cmd.Reply
 	} else {
 		// This command originated elsewhere so we must create a new reply buffer.
-		_, reply, err = proto.CreateArgsAndReply(method)
-		if err != nil {
-			log.Fatal(err)
-		}
+		reply = args.CreateReply()
 	}
-	err = r.executeCmd(index, method, args, reply)
+
+	err := r.applyRaftCommand(index, multiraft.NodeID(raftCmd.OriginNodeID), args, reply)
+
 	if cmd != nil {
 		cmd.done <- err
 	} else if err != nil {
-		log.Errorf("error executing raft command %s: %s", method, err)
+		log.Errorf("error executing raft command %s: %s", args.Method(), err)
 	}
 	return err
 }
 
-// startGossip periodically gossips the cluster ID if it's the
-// first range and the raft leader.
-func (r *Range) startGossip() {
-	r.stopper.RunWorker(func() {
-		ticker := time.NewTicker(ttlClusterIDGossip / 2)
-		for {
-			select {
-			case <-ticker.C:
-				r.maybeGossipClusterID()
-				r.maybeGossipFirstRange()
-			case <-r.stopper.ShouldStop():
-				return
-			}
-		}
-	})
-}
+// applyRaftCommand applies a raft command from the replicated log to
+// the underlying state machine (i.e. the engine).
+func (r *Range) applyRaftCommand(index uint64, originNodeID multiraft.NodeID, args proto.Request, reply proto.Response) error {
+	if index <= 0 {
+		log.Fatalf("raft command index is <= 0")
+	}
 
-// maybeGossipClusterID gossips the cluster ID if this range is
-// the start of the key space and the raft leader.
-func (r *Range) maybeGossipClusterID() {
-	if r.rm.Gossip() != nil && r.IsFirstRange() && r.IsLeader() {
-		if err := r.rm.Gossip().AddInfo(gossip.KeyClusterID, r.rm.ClusterID(), ttlClusterIDGossip); err != nil {
-			log.Errorf("failed to gossip cluster ID %s: %s", r.rm.ClusterID(), err)
+	committed := false
+	defer func() {
+		if !committed {
+			// We didn't commit the batch, but advance the last applied index nonetheless.
+			if err := setAppliedIndex(r.rm.Engine(), r.Desc().RaftID, index); err != nil {
+				log.Fatalf("could not advance applied index: %s", err)
+			}
+			atomic.StoreUint64(&r.appliedIndex, index)
+		}
+	}()
+
+	header := args.Header()
+
+	// Check the response cache to ensure idempotency.
+	if proto.IsWrite(args) {
+		if ok, err := r.respCache.GetResponse(header.CmdID, reply); ok && err == nil {
+			log.V(1).Infof("found response cache entry for %+v", args.Header().CmdID)
+			return reply.Header().GoError()
+		} else if ok && err != nil {
+			newErr := util.Errorf("unable to read result for %+v from the response cache: %s", args, err)
+			reply.Header().SetGoError(newErr)
+			return newErr
 		}
 	}
+
+	// Verify the leader lease is held; Note that we don't require the
+	// leader lease when trying to grant the leader lease!
+	if _, ok := args.(*proto.InternalLeaderLeaseRequest); !ok {
+		if !r.verifyLeaderLease(originNodeID, header.Timestamp) {
+			err := r.newNotLeaderError()
+			reply.Header().SetGoError(err)
+			return err
+		}
+	}
+
+	// Create a new batch for the command to ensure all or nothing semantics.
+	batch := r.rm.Engine().NewBatch()
+	defer batch.Close()
+
+	// Create an proto.MVCCStats instance.
+	ms := proto.MVCCStats{}
+
+	// Execute the command; the error will also be set in the reply header.
+	err := r.executeCmd(batch, &ms, args, reply)
+
+	if oldIndex := atomic.LoadUint64(&r.appliedIndex); oldIndex >= index {
+		log.Fatalf("applied index moved backwards: %d >= %d", oldIndex, index)
+	}
+
+	// Advance the applied index atomically within the batch.
+	if e := setAppliedIndex(batch, r.Desc().RaftID, index); e != nil {
+		if reply.Header().GoError() == nil {
+			reply.Header().SetGoError(e)
+		}
+		err = e
+	}
+
+	if err == nil && proto.IsWrite(args) {
+		// On success, flush the MVCC stats to the batch and commit.
+		r.stats.MergeMVCCStats(batch, &ms, header.Timestamp.WallTime)
+		if err := batch.Commit(); err != nil {
+			log.Fatalf("failed to commit batch from Raft command execution: %s", err)
+		}
+		committed = true
+		// Publish update to event feed.
+		r.rm.EventFeed().updateRange(r, args.Method(), &ms)
+		// After successful commit, update cached stats and appliedIndex value.
+		atomic.StoreUint64(&r.appliedIndex, index)
+		r.stats.Update(ms)
+		// If the commit succeeded, potentially add range to split queue.
+		r.maybeAddToSplitQueue()
+		// Maybe update gossip configs on a put.
+		switch args.(type) {
+		case *proto.PutRequest, *proto.DeleteRequest, *proto.DeleteRangeRequest:
+			if header.Key.Less(engine.KeySystemMax) {
+				r.maybeGossipConfigs(func(configPrefix proto.Key) bool {
+					return bytes.HasPrefix(header.Key, configPrefix)
+				})
+			}
+		}
+	}
+
+	// Add this command's result to the response cache if this is a
+	// read/write method. This must be done as part of the execution of
+	// raft commands so that every replica maintains the same responses
+	// to continue request idempotence when leadership changes.
+	if proto.IsWrite(args) {
+		if putErr := r.respCache.PutResponse(args.Header().CmdID, reply); putErr != nil {
+			log.Errorf("unable to write result of %+v: %+v to the response cache: %s",
+				args, reply, putErr)
+		}
+	}
+
+	return reply.Header().GoError()
 }
 
-// maybeGossipFirstRange gossips the range locations if this range is
-// the start of the key space and the raft leader.
-func (r *Range) maybeGossipFirstRange() {
-	if r.rm.Gossip() != nil && r.IsFirstRange() && r.IsLeader() {
-		if err := r.rm.Gossip().AddInfo(gossip.KeyFirstRangeDescriptor, *r.Desc(), 0*time.Second); err != nil {
-			log.Errorf("failed to gossip first range metadata: %s", err)
+// maybeGossipFirstRangeWithLease is periodically called and gossips the
+// sentinel and first range metadata if the range has the lease. Since one
+// replica should always gossip this information, a lease is acquired if there
+// is no active lease.
+func (r *Range) maybeGossipFirstRangeWithLease() {
+	// If no Gossip available (some tests) or not first range: nothing to do.
+	if r.rm.Gossip() == nil || !r.isInitialized() {
+		return
+	}
+	timestamp := r.rm.Clock().Now()
+
+	// Check for or obtain the lease, if none active.
+	if err := r.redirectOnOrAcquireLeaderLease(timestamp); err != nil {
+		switch e := err.(type) {
+		// NotLeaderError means there is an active lease, leaseRejectedError
+		// means we tried to get one but someone beat us to it. They're nothing
+		// to worry about.
+		case *proto.NotLeaderError, *leaseRejectedError:
+		default:
+			// Any other error is worth being logged visibly.
+			log.Warningf("could not acquire lease for first range gossip: %s", e)
 		}
+		return
+	}
+	r.gossipFirstRange()
+}
+
+// gossipFirstRange adds the sentinel and first range metadata to gossip.
+func (r *Range) gossipFirstRange() {
+	if r.rm.Gossip() == nil {
+		return
+	}
+	if err := r.rm.Gossip().AddInfo(gossip.KeyClusterID, r.rm.ClusterID(), ttlClusterIDGossip); err != nil {
+		log.Errorf("failed to gossip cluster ID %s: %s", r.rm.ClusterID(), err)
+	}
+	if err := r.rm.Gossip().AddInfo(gossip.KeyFirstRangeDescriptor, *r.Desc(), 0*time.Second); err != nil {
+		log.Errorf("failed to gossip first range metadata: %s", err)
 	}
 }
 
 // maybeGossipConfigs gossips configuration maps if their data falls
-// within the range, this replica is the raft leader, and their
-// contents are marked dirty. Configuration maps include accounting,
-// permissions, and zones.
-func (r *Range) maybeGossipConfigs(dirtyConfigs ...*configDescriptor) {
-	if r.rm.Gossip() != nil && r.IsLeader() {
-		for _, cd := range dirtyConfigs {
-			if r.ContainsKey(cd.keyPrefix) {
+// within the range, and their contents are marked dirty.
+// Configuration maps include accounting, permissions, and zones.
+func (r *Range) maybeGossipConfigs(match func(configPrefix proto.Key) bool) {
+	if r.rm.Gossip() == nil {
+		return
+	}
+	held, expired := r.HasLeaderLease(r.rm.Clock().Now())
+	if r.getLease().RaftNodeID == 0 || (held && !expired) {
+		for _, cd := range configDescriptors {
+			if match(cd.keyPrefix) {
 				// Check for a bad range split. This should never happen as ranges
 				// cannot be split mid-config.
 				if !r.ContainsKey(cd.keyPrefix.PrefixEnd()) {
@@ -747,758 +980,14 @@ func (r *Range) loadConfigMap(keyPrefix proto.Key, configI interface{}) (PrefixC
 	return NewPrefixConfigMap(configs)
 }
 
-// maybeUpdateGossipConfigs is used to update gossip configs.
-func (r *Range) maybeUpdateGossipConfigs(key proto.Key) {
-	// Check whether this put has modified a configuration map.
-	for _, cd := range configDescriptors {
-		if bytes.HasPrefix(key, cd.keyPrefix) {
-			r.maybeGossipConfigs(cd)
-			break
-		}
-	}
-}
-
-// maybeSplit checks whether the current size of the range exceeds the
-// max size specified in the zone config. If yes, the range is added
-// to the split queue.
-func (r *Range) maybeSplit() {
-	if !r.IsLeader() {
-		return
-	}
+// maybeAddToSplitQueue checks whether the current size of the range
+// exceeds the max size specified in the zone config. If yes, the
+// range is added to the split queue.
+func (r *Range) maybeAddToSplitQueue() {
 	maxBytes := r.GetMaxBytes()
 	if maxBytes > 0 && r.stats.KeyBytes+r.stats.ValBytes > maxBytes {
 		r.rm.SplitQueue().MaybeAdd(r, r.rm.Clock().Now())
 	}
-}
-
-// executeCmd switches over the method and multiplexes to execute the
-// appropriate storage API command.
-//
-// TODO(Spencer): Differentiate between errors caused by the normal culprits --
-// bad inputs from clients, stale information, etc. and errors which might
-// cause the range replicas to diverge -- running out of disk space, underlying
-// rocksdb corruption, etc. Do a careful code audit to make sure we identify
-// errors which should be classified as a ReplicaCorruptionError--when those
-// bubble up to the point where we've just tried to execute a Raft command, the
-// Raft replica would need to stall itself.
-func (r *Range) executeCmd(index uint64, method string, args proto.Request,
-	reply proto.Response) error {
-	// Verify key is contained within range here to catch any range split
-	// or merge activity.
-	header := args.Header()
-	if !r.ContainsKeyRange(header.Key, header.EndKey) {
-		err := proto.NewRangeKeyMismatchError(header.Key, header.EndKey, r.Desc())
-		reply.Header().SetGoError(err)
-		return err
-	}
-
-	// If a unittest filter was installed, check for an injected error; otherwise, continue.
-	if TestingCommandFilter != nil && TestingCommandFilter(method, args, reply) {
-		return reply.Header().GoError()
-	}
-
-	// Create a new batch for the command to ensure all or nothing semantics.
-	batch := r.rm.Engine().NewBatch()
-	// Create an engine.MVCCStats instance.
-	ms := engine.MVCCStats{}
-
-	switch method {
-	case proto.Contains:
-		r.Contains(batch, args.(*proto.ContainsRequest), reply.(*proto.ContainsResponse))
-	case proto.Get:
-		r.Get(batch, args.(*proto.GetRequest), reply.(*proto.GetResponse))
-	case proto.Put:
-		r.Put(batch, &ms, args.(*proto.PutRequest), reply.(*proto.PutResponse))
-	case proto.ConditionalPut:
-		r.ConditionalPut(batch, &ms, args.(*proto.ConditionalPutRequest), reply.(*proto.ConditionalPutResponse))
-	case proto.Increment:
-		r.Increment(batch, &ms, args.(*proto.IncrementRequest), reply.(*proto.IncrementResponse))
-	case proto.Delete:
-		r.Delete(batch, &ms, args.(*proto.DeleteRequest), reply.(*proto.DeleteResponse))
-	case proto.DeleteRange:
-		r.DeleteRange(batch, &ms, args.(*proto.DeleteRangeRequest), reply.(*proto.DeleteRangeResponse))
-	case proto.Scan:
-		r.Scan(batch, args.(*proto.ScanRequest), reply.(*proto.ScanResponse))
-	case proto.EndTransaction:
-		r.EndTransaction(batch, &ms, args.(*proto.EndTransactionRequest), reply.(*proto.EndTransactionResponse))
-	case proto.ReapQueue:
-		r.ReapQueue(batch, args.(*proto.ReapQueueRequest), reply.(*proto.ReapQueueResponse))
-	case proto.EnqueueUpdate:
-		r.EnqueueUpdate(batch, args.(*proto.EnqueueUpdateRequest), reply.(*proto.EnqueueUpdateResponse))
-	case proto.EnqueueMessage:
-		r.EnqueueMessage(batch, args.(*proto.EnqueueMessageRequest), reply.(*proto.EnqueueMessageResponse))
-	case proto.InternalRangeLookup:
-		r.InternalRangeLookup(batch, args.(*proto.InternalRangeLookupRequest), reply.(*proto.InternalRangeLookupResponse))
-	case proto.InternalHeartbeatTxn:
-		r.InternalHeartbeatTxn(batch, args.(*proto.InternalHeartbeatTxnRequest), reply.(*proto.InternalHeartbeatTxnResponse))
-	case proto.InternalGC:
-		r.InternalGC(batch, &ms, args.(*proto.InternalGCRequest), reply.(*proto.InternalGCResponse))
-	case proto.InternalPushTxn:
-		r.InternalPushTxn(batch, args.(*proto.InternalPushTxnRequest), reply.(*proto.InternalPushTxnResponse))
-	case proto.InternalResolveIntent:
-		r.InternalResolveIntent(batch, &ms, args.(*proto.InternalResolveIntentRequest), reply.(*proto.InternalResolveIntentResponse))
-	case proto.InternalMerge:
-		r.InternalMerge(batch, &ms, args.(*proto.InternalMergeRequest), reply.(*proto.InternalMergeResponse))
-	case proto.InternalTruncateLog:
-		r.InternalTruncateLog(batch, &ms, args.(*proto.InternalTruncateLogRequest), reply.(*proto.InternalTruncateLogResponse))
-	case proto.InternalLeaderLease:
-		r.InternalLeaderLease(args.(*proto.InternalLeaderLeaseRequest), reply.(*proto.InternalLeaderLeaseResponse))
-	default:
-		return util.Errorf("unrecognized command %s", method)
-	}
-
-	// On success, flush the MVCC stats to the batch and commit.
-	if err := reply.Header().GoError(); err == nil {
-		// If we are applying a raft command, update the applied index.
-		if index > 0 {
-			if oldIndex := atomic.LoadUint64(&r.appliedIndex); oldIndex >= index {
-				log.Fatalf("applied index moved backwards: %d >= %d", oldIndex, index)
-			}
-			atomic.StoreUint64(&r.appliedIndex, index)
-			err := engine.MVCCPut(batch, &ms, engine.RaftAppliedIndexKey(r.Desc().RaftID),
-				proto.ZeroTimestamp, proto.Value{Bytes: encoding.EncodeUint64(nil, index)}, nil)
-			if err != nil {
-				reply.Header().SetGoError(err)
-			}
-		}
-
-		if proto.IsReadWrite(method) {
-			r.stats.MergeMVCCStats(batch, &ms, header.Timestamp.WallTime)
-			if err := batch.Commit(); err != nil {
-				reply.Header().SetGoError(err)
-			} else {
-				// After successful commit, update cached stats values.
-				r.stats.Update(ms)
-				// If the commit succeeded, potentially add range to split queue.
-				r.maybeSplit()
-				// Maybe update gossip configs on a put.
-				if (method == proto.Put || method == proto.ConditionalPut) && header.Key.Less(engine.KeySystemMax) {
-					r.maybeUpdateGossipConfigs(header.Key)
-				}
-			}
-		}
-	} else {
-		if index > 0 {
-			atomic.StoreUint64(&r.appliedIndex, index)
-			// On failure, abandon the batch we've built up, but still update the
-			// applied index so we won't retry this command on restart.
-			if err := engine.MVCCPut(r.rm.Engine(), nil, engine.RaftAppliedIndexKey(r.Desc().RaftID),
-				proto.ZeroTimestamp, proto.Value{Bytes: encoding.EncodeUint64(nil, index)}, nil); err != nil {
-				// The reply header already contains an error which is going to be more useful
-				// the caller than this one, so just log it.
-				log.Errorf("failed to advance applied index: %s", err)
-			}
-		}
-
-		if err, ok := reply.Header().GoError().(*proto.ReadWithinUncertaintyIntervalError); ok {
-			// A ReadUncertaintyIntervalError contains the timestamp of the value
-			// that provoked the conflict. However, we forward the timestamp to the
-			// node's time here. The reason is that the caller (which is always
-			// transactional when this error occurs) in our implementation wants to
-			// use this information to extract a timestamp after which reads from
-			// the nodes are causally consistent with the transaction. This allows
-			// the node to be classified as without further uncertain reads for the
-			// remainder of the transaction.
-			// See the comment on proto.Transaction.CertainNodes.
-			err.ExistingTimestamp.Forward(r.rm.Clock().Now())
-		}
-	}
-
-	// Propagate the request timestamp (which may have changed).
-	reply.Header().Timestamp = args.Header().Timestamp
-
-	log.V(1).Infof("executed %s command %+v: %+v", method, args, reply)
-
-	// Add this command's result to the response cache if this is a
-	// read/write method. This must be done as part of the execution of
-	// raft commands so that every replica maintains the same responses
-	// to continue request idempotence when leadership changes.
-	if proto.IsReadWrite(method) {
-		if putErr := r.respCache.PutResponse(args.Header().CmdID, reply); putErr != nil {
-			log.Errorf("unable to write result of %+v: %+v to the response cache: %s",
-				args, reply, putErr)
-		}
-	}
-
-	// Return the error (if any) set in the reply.
-	return reply.Header().GoError()
-}
-
-// Contains verifies the existence of a key in the key value store.
-func (r *Range) Contains(batch engine.Engine, args *proto.ContainsRequest, reply *proto.ContainsResponse) {
-	val, err := engine.MVCCGet(batch, args.Key, args.Timestamp, args.ReadConsistency == proto.CONSISTENT, args.Txn)
-	if err != nil {
-		reply.SetGoError(err)
-		return
-	}
-	if val != nil {
-		reply.Exists = true
-	}
-}
-
-// Get returns the value for a specified key.
-func (r *Range) Get(batch engine.Engine, args *proto.GetRequest, reply *proto.GetResponse) {
-	val, err := engine.MVCCGet(batch, args.Key, args.Timestamp, args.ReadConsistency == proto.CONSISTENT, args.Txn)
-	reply.Value = val
-	reply.SetGoError(err)
-}
-
-// Put sets the value for a specified key.
-func (r *Range) Put(batch engine.Engine, ms *engine.MVCCStats, args *proto.PutRequest, reply *proto.PutResponse) {
-	err := engine.MVCCPut(batch, ms, args.Key, args.Timestamp, args.Value, args.Txn)
-	reply.SetGoError(err)
-}
-
-// ConditionalPut sets the value for a specified key only if
-// the expected value matches. If not, the return value contains
-// the actual value.
-func (r *Range) ConditionalPut(batch engine.Engine, ms *engine.MVCCStats, args *proto.ConditionalPutRequest, reply *proto.ConditionalPutResponse) {
-	err := engine.MVCCConditionalPut(batch, ms, args.Key, args.Timestamp, args.Value, args.ExpValue, args.Txn)
-	reply.SetGoError(err)
-}
-
-// Increment increments the value (interpreted as varint64 encoded) and
-// returns the newly incremented value (encoded as varint64). If no value
-// exists for the key, zero is incremented.
-func (r *Range) Increment(batch engine.Engine, ms *engine.MVCCStats, args *proto.IncrementRequest, reply *proto.IncrementResponse) {
-	val, err := engine.MVCCIncrement(batch, ms, args.Key, args.Timestamp, args.Txn, args.Increment)
-	reply.NewValue = val
-	reply.SetGoError(err)
-}
-
-// Delete deletes the key and value specified by key.
-func (r *Range) Delete(batch engine.Engine, ms *engine.MVCCStats, args *proto.DeleteRequest, reply *proto.DeleteResponse) {
-	reply.SetGoError(engine.MVCCDelete(batch, ms, args.Key, args.Timestamp, args.Txn))
-}
-
-// DeleteRange deletes the range of key/value pairs specified by
-// start and end keys.
-func (r *Range) DeleteRange(batch engine.Engine, ms *engine.MVCCStats, args *proto.DeleteRangeRequest, reply *proto.DeleteRangeResponse) {
-	num, err := engine.MVCCDeleteRange(batch, ms, args.Key, args.EndKey, args.MaxEntriesToDelete, args.Timestamp, args.Txn)
-	reply.NumDeleted = num
-	reply.SetGoError(err)
-}
-
-// Scan scans the key range specified by start key through end key up
-// to some maximum number of results. The last key of the iteration is
-// returned with the reply.
-func (r *Range) Scan(batch engine.Engine, args *proto.ScanRequest, reply *proto.ScanResponse) {
-	kvs, err := engine.MVCCScan(batch, args.Key, args.EndKey, args.MaxResults, args.Timestamp, args.ReadConsistency == proto.CONSISTENT, args.Txn)
-	reply.Rows = kvs
-	reply.SetGoError(err)
-}
-
-// EndTransaction either commits or aborts (rolls back) an extant
-// transaction according to the args.Commit parameter.
-func (r *Range) EndTransaction(batch engine.Engine, ms *engine.MVCCStats, args *proto.EndTransactionRequest, reply *proto.EndTransactionResponse) {
-	if args.Txn == nil {
-		reply.SetGoError(util.Errorf("no transaction specified to EndTransaction"))
-		return
-	}
-	key := engine.TransactionKey(args.Txn.Key, args.Txn.ID)
-
-	// Fetch existing transaction if possible.
-	existTxn := &proto.Transaction{}
-	ok, err := engine.MVCCGetProto(batch, key, proto.ZeroTimestamp, true, nil, existTxn)
-	if err != nil {
-		reply.SetGoError(err)
-		return
-	}
-	// If the transaction record already exists, verify that we can either
-	// commit it or abort it (according to args.Commit), and also that the
-	// Timestamp and Epoch have not suffered regression.
-	if ok {
-		// Use the persisted transaction record as final transaction.
-		reply.Txn = gogoproto.Clone(existTxn).(*proto.Transaction)
-
-		if existTxn.Status == proto.COMMITTED {
-			reply.SetGoError(proto.NewTransactionStatusError(existTxn, "already committed"))
-			return
-		} else if existTxn.Status == proto.ABORTED {
-			reply.SetGoError(proto.NewTransactionAbortedError(existTxn))
-			return
-		} else if args.Txn.Epoch < existTxn.Epoch {
-			reply.SetGoError(proto.NewTransactionStatusError(existTxn, fmt.Sprintf("epoch regression: %d", args.Txn.Epoch)))
-			return
-		} else if existTxn.Timestamp.Less(args.Txn.OrigTimestamp) {
-			// The transaction record can only ever be pushed forward, so it's an
-			// error if somehow the transaction record has an earlier timestamp
-			// than the original transaction timestamp.
-			reply.SetGoError(proto.NewTransactionStatusError(existTxn, fmt.Sprintf("timestamp regression: %s", args.Txn.OrigTimestamp)))
-			return
-		}
-		// Take max of requested epoch and existing epoch. The requester
-		// may have incremented the epoch on retries.
-		if reply.Txn.Epoch < args.Txn.Epoch {
-			reply.Txn.Epoch = args.Txn.Epoch
-		}
-		// Take max of requested priority and existing priority. This isn't
-		// terribly useful, but we do it for completeness.
-		if reply.Txn.Priority < args.Txn.Priority {
-			reply.Txn.Priority = args.Txn.Priority
-		}
-	} else {
-		// The transaction doesn't exist yet on disk; use the supplied version.
-		reply.Txn = gogoproto.Clone(args.Txn).(*proto.Transaction)
-	}
-
-	// Take max of requested timestamp and possibly "pushed" txn
-	// record timestamp as the final commit timestamp.
-	if reply.Txn.Timestamp.Less(args.Timestamp) {
-		reply.Txn.Timestamp = args.Timestamp
-	}
-
-	// Set transaction status to COMMITTED or ABORTED as per the
-	// args.Commit parameter.
-	if args.Commit {
-		// If the isolation level is SERIALIZABLE, return a transaction
-		// retry error if the commit timestamp isn't equal to the txn
-		// timestamp.
-		if args.Txn.Isolation == proto.SERIALIZABLE && !reply.Txn.Timestamp.Equal(args.Txn.OrigTimestamp) {
-			reply.SetGoError(proto.NewTransactionRetryError(reply.Txn))
-			return
-		}
-		reply.Txn.Status = proto.COMMITTED
-	} else {
-		reply.Txn.Status = proto.ABORTED
-	}
-
-	// Persist the transaction record with updated status (& possibly timestamp).
-	if err := engine.MVCCPutProto(batch, nil, key, proto.ZeroTimestamp, nil, reply.Txn); err != nil {
-		reply.SetGoError(err)
-		return
-	}
-
-	// Run triggers if successfully committed. Any failures running
-	// triggers will set an error and prevent the batch from committing.
-	if ct := args.InternalCommitTrigger; ct != nil {
-		// Resolve any explicit intents.
-		for _, key := range ct.Intents {
-			log.V(1).Infof("resolving intent at %s on end transaction [%s]", key, reply.Txn.Status)
-			if err := engine.MVCCResolveWriteIntent(batch, ms, key, reply.Txn.Timestamp, reply.Txn); err != nil {
-				reply.SetGoError(err)
-				return
-			}
-			reply.Resolved = append(reply.Resolved, key)
-		}
-		// Run appropriate trigger.
-		if reply.Txn.Status == proto.COMMITTED {
-			if ct.SplitTrigger != nil {
-				reply.SetGoError(r.splitTrigger(batch, ct.SplitTrigger))
-			} else if ct.MergeTrigger != nil {
-				reply.SetGoError(r.mergeTrigger(batch, ct.MergeTrigger))
-			} else if ct.ChangeReplicasTrigger != nil {
-				reply.SetGoError(r.changeReplicasTrigger(ct.ChangeReplicasTrigger))
-			}
-		}
-	}
-}
-
-// ReapQueue destructively queries messages from a delivery inbox
-// queue. This method must be called from within a transaction.
-func (r *Range) ReapQueue(batch engine.Engine, args *proto.ReapQueueRequest, reply *proto.ReapQueueResponse) {
-	reply.SetGoError(util.Error("unimplemented"))
-}
-
-// EnqueueUpdate sidelines an update for asynchronous execution.
-// AccumulateTS updates are sent this way. Eventually-consistent indexes
-// are also built using update queues. Crucially, the enqueue happens
-// as part of the caller's transaction, so is guaranteed to be
-// executed if the transaction succeeded.
-func (r *Range) EnqueueUpdate(batch engine.Engine, args *proto.EnqueueUpdateRequest, reply *proto.EnqueueUpdateResponse) {
-	reply.SetGoError(util.Error("unimplemented"))
-}
-
-// EnqueueMessage enqueues a message (Value) for delivery to a
-// recipient inbox.
-func (r *Range) EnqueueMessage(batch engine.Engine, args *proto.EnqueueMessageRequest, reply *proto.EnqueueMessageResponse) {
-	reply.SetGoError(util.Error("unimplemented"))
-}
-
-// InternalRangeLookup is used to look up RangeDescriptors - a RangeDescriptor
-// is a metadata structure which describes the key range and replica locations
-// of a distinct range in the cluster.
-//
-// RangeDescriptors are stored as values in the cockroach cluster's key-value
-// store. However, they are always stored using special "Range Metadata keys",
-// which are "ordinary" keys with a special prefix prepended. The Range Metadata
-// Key for an ordinary key can be generated with the `engine.RangeMetaKey(key)`
-// function. The RangeDescriptor for the range which contains a given key can be
-// retrieved by generating its Range Metadata Key and dispatching it to
-// InternalRangeLookup.
-//
-// Note that the Range Metadata Key sent to InternalRangeLookup is NOT the key
-// at which the desired RangeDescriptor is stored. Instead, this method returns
-// the RangeDescriptor stored at the _lowest_ existing key which is _greater_
-// than the given key. The returned RangeDescriptor will thus contain the
-// ordinary key which was originally used to generate the Range Metadata Key
-// sent to InternalRangeLookup.
-//
-// The "Range Metadata Key" for a range is built by appending the end key of
-// the range to the meta[12] prefix because the RocksDB iterator only supports
-// a Seek() interface which acts as a Ceil(). Using the start key of the range
-// would cause Seek() to find the key after the meta indexing record we're
-// looking for, which would result in having to back the iterator up, an option
-// which is both less efficient and not available in all cases.
-//
-// This method has an important optimization: instead of just returning the
-// request RangeDescriptor, it also returns a slice of additional range
-// descriptors immediately consecutive to the desired RangeDescriptor. This is
-// intended to serve as a sort of caching pre-fetch, so that the requesting
-// nodes can aggressively cache RangeDescriptors which are likely to be desired
-// by their current workload.
-func (r *Range) InternalRangeLookup(batch engine.Engine, args *proto.InternalRangeLookupRequest, reply *proto.InternalRangeLookupResponse) {
-	if err := engine.ValidateRangeMetaKey(args.Key); err != nil {
-		reply.SetGoError(err)
-		return
-	}
-
-	rangeCount := int64(args.MaxRanges)
-	if rangeCount < 1 {
-		reply.SetGoError(util.Errorf(
-			"Range lookup specified invalid maximum range count %d: must be > 0", rangeCount))
-		return
-	}
-
-	// We want to search for the metadata key just greater than args.Key. Scan
-	// for both the requested key and the keys immediately afterwards, up to
-	// MaxRanges.
-	metaPrefix := proto.Key(args.Key[:len(engine.KeyMeta1Prefix)])
-	nextKey := proto.Key(args.Key).Next()
-	// Always false, at least when called from the DistSender.
-	consistent := args.ReadConsistency != proto.INCONSISTENT
-	kvs, err := engine.MVCCScan(batch, nextKey, metaPrefix.PrefixEnd(), rangeCount, args.Timestamp, consistent, args.Txn)
-	if err != nil {
-		reply.SetGoError(err)
-		return
-	}
-
-	// The initial key must have the same metadata level prefix as we queried.
-	if len(kvs) == 0 {
-		// At this point the range has been verified to contain the requested
-		// key, but no matching results were returned from the scan. This could
-		// indicate a very bad system error, but for now we will just treat it
-		// as a retryable Key Mismatch error.
-		err := proto.NewRangeKeyMismatchError(args.Key, args.EndKey, r.Desc())
-		reply.SetGoError(err)
-		log.Errorf("InternalRangeLookup dispatched to correct range, but no matching RangeDescriptor was found. %s", err)
-		return
-	}
-
-	// Decode all scanned range descriptors, stopping if a range is encountered
-	// which does not have the same metadata prefix as the queried key.
-	rds := make([]proto.RangeDescriptor, len(kvs))
-	for i := range kvs {
-		if err = gogoproto.Unmarshal(kvs[i].Value.Bytes, &rds[i]); err != nil {
-			reply.SetGoError(err)
-			return
-		}
-	}
-
-	reply.Ranges = rds
-	return
-}
-
-// InternalHeartbeatTxn updates the transaction status and heartbeat
-// timestamp after receiving transaction heartbeat messages from
-// coordinator. Returns the updated transaction.
-func (r *Range) InternalHeartbeatTxn(batch engine.Engine, args *proto.InternalHeartbeatTxnRequest, reply *proto.InternalHeartbeatTxnResponse) {
-	key := engine.TransactionKey(args.Txn.Key, args.Txn.ID)
-
-	var txn proto.Transaction
-	ok, err := engine.MVCCGetProto(batch, key, proto.ZeroTimestamp, true, nil, &txn)
-	if err != nil {
-		reply.SetGoError(err)
-		return
-	}
-	// If no existing transaction record was found, initialize
-	// to the transaction in the request header.
-	if !ok {
-		gogoproto.Merge(&txn, args.Txn)
-	}
-	if txn.Status == proto.PENDING {
-		if txn.LastHeartbeat == nil {
-			txn.LastHeartbeat = &proto.Timestamp{}
-		}
-		if txn.LastHeartbeat.Less(args.Header().Timestamp) {
-			*txn.LastHeartbeat = args.Header().Timestamp
-		}
-		if err := engine.MVCCPutProto(batch, nil, key, proto.ZeroTimestamp, nil, &txn); err != nil {
-			reply.SetGoError(err)
-			return
-		}
-	}
-	reply.Txn = &txn
-}
-
-// InternalGC iterates through the list of keys to garbage collect
-// specified in the arguments. MVCCGarbageCollect is invoked on each
-// listed key along with the expiration timestamp. The GC metadata
-// specified in the args is persisted after GC.
-func (r *Range) InternalGC(batch engine.Engine, ms *engine.MVCCStats, args *proto.InternalGCRequest, reply *proto.InternalGCResponse) {
-	// Garbage collect the specified keys by expiration timestamps.
-	if err := engine.MVCCGarbageCollect(batch, ms, args.Keys, args.Timestamp); err != nil {
-		reply.SetGoError(err)
-		return
-	}
-
-	// Store the GC metadata for this range.
-	key := engine.RangeGCMetadataKey(r.Desc().RaftID)
-	err := engine.MVCCPutProto(batch, ms, key, proto.ZeroTimestamp, nil, &args.GCMeta)
-	reply.SetGoError(err)
-}
-
-// InternalPushTxn resolves conflicts between concurrent txns (or
-// between a non-transactional reader or writer and a txn) in several
-// ways depending on the statuses and priorities of the conflicting
-// transactions. The InternalPushTxn operation is invoked by a
-// "pusher" (the writer trying to abort a conflicting txn or the
-// reader trying to push a conflicting txn's commit timestamp
-// forward), who attempts to resolve a conflict with a "pushee"
-// (args.PushTxn -- the pushee txn whose intent(s) caused the
-// conflict).
-//
-// Txn already committed/aborted: If pushee txn is committed or
-// aborted return success.
-//
-// Txn Timeout: If pushee txn entry isn't present or its LastHeartbeat
-// timestamp isn't set, use PushTxn.Timestamp as LastHeartbeat. If
-// current time - LastHeartbeat > 2 * DefaultHeartbeatInterval, then
-// the pushee txn should be either pushed forward or aborted,
-// depending on value of Request.Abort.
-//
-// Old Txn Epoch: If persisted pushee txn entry has a newer Epoch than
-// PushTxn.Epoch, return success, as older epoch may be removed.
-//
-// Lower Txn Priority: If pushee txn has a lower priority than pusher,
-// adjust pushee's persisted txn depending on value of args.Abort. If
-// args.Abort is true, set txn.Status to ABORTED, and priority to one
-// less than the pusher's priority and return success. If args.Abort
-// is false, set txn.Timestamp to pusher's Timestamp + 1 (note that
-// we use the pusher's Args.Timestamp, not Txn.Timestamp because the
-// args timestamp can advance during the txn).
-//
-// Higher Txn Priority: If pushee txn has a higher priority than
-// pusher, return TransactionPushError. Transaction will be retried
-// with priority one less than the pushee's higher priority.
-func (r *Range) InternalPushTxn(batch engine.Engine, args *proto.InternalPushTxnRequest, reply *proto.InternalPushTxnResponse) {
-	if !bytes.Equal(args.Key, args.PusheeTxn.Key) {
-		reply.SetGoError(util.Errorf("request key %s should match pushee's txn key %s", args.Key, args.PusheeTxn.Key))
-		return
-	}
-	key := engine.TransactionKey(args.PusheeTxn.Key, args.PusheeTxn.ID)
-
-	// Fetch existing transaction if possible.
-	existTxn := &proto.Transaction{}
-	ok, err := engine.MVCCGetProto(batch, key, proto.ZeroTimestamp, true, nil, existTxn)
-	if err != nil {
-		reply.SetGoError(err)
-		return
-	}
-	if ok {
-		// Start with the persisted transaction record as final transaction.
-		reply.PusheeTxn = gogoproto.Clone(existTxn).(*proto.Transaction)
-		// Upgrade the epoch, timestamp and priority as necessary.
-		if reply.PusheeTxn.Epoch < args.PusheeTxn.Epoch {
-			reply.PusheeTxn.Epoch = args.PusheeTxn.Epoch
-		}
-		if reply.PusheeTxn.Timestamp.Less(args.PusheeTxn.Timestamp) {
-			reply.PusheeTxn.Timestamp = args.PusheeTxn.Timestamp
-		}
-		if reply.PusheeTxn.Priority < args.PusheeTxn.Priority {
-			reply.PusheeTxn.Priority = args.PusheeTxn.Priority
-		}
-	} else {
-		// Some sanity checks for case where we don't find a transaction record.
-		if args.PusheeTxn.LastHeartbeat != nil {
-			reply.SetGoError(proto.NewTransactionStatusError(&args.PusheeTxn,
-				"no txn persisted, yet intent has heartbeat"))
-			return
-		} else if args.PusheeTxn.Status != proto.PENDING {
-			reply.SetGoError(proto.NewTransactionStatusError(&args.PusheeTxn,
-				fmt.Sprintf("no txn persisted, yet intent has status %s", args.PusheeTxn.Status)))
-			return
-		}
-		// The transaction doesn't exist yet on disk; use the supplied version.
-		reply.PusheeTxn = gogoproto.Clone(&args.PusheeTxn).(*proto.Transaction)
-	}
-
-	// If already committed or aborted, return success.
-	if reply.PusheeTxn.Status != proto.PENDING {
-		// Trivial noop.
-		return
-	}
-	// If we're trying to move the timestamp forward, and it's already
-	// far enough forward, return success.
-	if !args.Abort && args.Timestamp.Less(reply.PusheeTxn.Timestamp) {
-		// Trivial noop.
-		return
-	}
-
-	// pusherWins bool is true in the event the pusher prevails.
-	var pusherWins bool
-
-	// If there's no incoming transaction, the pusher is
-	// non-transactional. We make a random priority, biased by
-	// specified args.Header().UserPriority in this case.
-	var priority int32
-	if args.Txn != nil {
-		priority = args.Txn.Priority
-	} else {
-		priority = proto.MakePriority(args.GetUserPriority())
-	}
-
-	// Check for txn timeout.
-	if reply.PusheeTxn.LastHeartbeat == nil {
-		reply.PusheeTxn.LastHeartbeat = &reply.PusheeTxn.Timestamp
-	}
-	// Compute heartbeat expiration.
-	expiry := r.rm.Clock().Now()
-	expiry.WallTime -= 2 * DefaultHeartbeatInterval.Nanoseconds()
-	if reply.PusheeTxn.LastHeartbeat.Less(expiry) {
-		log.V(1).Infof("pushing expired txn %s", reply.PusheeTxn)
-		pusherWins = true
-	} else if args.PusheeTxn.Epoch < reply.PusheeTxn.Epoch {
-		// Check for an intent from a prior epoch.
-		log.V(1).Infof("pushing intent from previous epoch for txn %s", reply.PusheeTxn)
-		pusherWins = true
-	} else if reply.PusheeTxn.Priority < priority ||
-		(reply.PusheeTxn.Priority == priority && args.Txn.Timestamp.Less(reply.PusheeTxn.Timestamp)) {
-		// Finally, choose based on priority; if priorities are equal, order by lower txn timestamp.
-		log.V(1).Infof("pushing intent from txn with lower priority %s vs %d", reply.PusheeTxn, priority)
-		pusherWins = true
-	} else if reply.PusheeTxn.Isolation == proto.SNAPSHOT && !args.Abort {
-		log.V(1).Infof("pushing timestamp for snapshot isolation txn")
-		pusherWins = true
-	}
-
-	if !pusherWins {
-		log.V(1).Infof("failed to push intent %s vs %s using priority=%d", reply.PusheeTxn, args.Txn, priority)
-		reply.SetGoError(proto.NewTransactionPushError(args.Txn, reply.PusheeTxn))
-		return
-	}
-
-	// Upgrade priority of pushed transaction to one less than pusher's.
-	reply.PusheeTxn.UpgradePriority(priority - 1)
-
-	// If aborting transaction, set new status and return success.
-	if args.Abort {
-		reply.PusheeTxn.Status = proto.ABORTED
-	} else {
-		// Otherwise, update timestamp to be one greater than the request's timestamp.
-		reply.PusheeTxn.Timestamp = args.Timestamp
-		reply.PusheeTxn.Timestamp.Logical++
-	}
-
-	// Persist the pushed transaction using zero timestamp for inline value.
-	if err := engine.MVCCPutProto(batch, nil, key, proto.ZeroTimestamp, nil, reply.PusheeTxn); err != nil {
-		reply.SetGoError(err)
-		return
-	}
-}
-
-// InternalResolveIntent updates the transaction status and heartbeat
-// timestamp after receiving transaction heartbeat messages from
-// coordinator. The range will return the current status for this
-// transaction to the coordinator.
-func (r *Range) InternalResolveIntent(batch engine.Engine, ms *engine.MVCCStats, args *proto.InternalResolveIntentRequest, reply *proto.InternalResolveIntentResponse) {
-	if args.Txn == nil {
-		reply.SetGoError(util.Errorf("no transaction specified to InternalResolveIntent"))
-		return
-	}
-	if len(args.EndKey) == 0 || bytes.Equal(args.Key, args.EndKey) {
-		reply.SetGoError(engine.MVCCResolveWriteIntent(batch, ms, args.Key, args.Timestamp, args.Txn))
-	} else {
-		_, err := engine.MVCCResolveWriteIntentRange(batch, ms, args.Key, args.EndKey, 0, args.Timestamp, args.Txn)
-		reply.SetGoError(err)
-	}
-}
-
-// InternalMerge is used to merge a value into an existing key. Merge is an
-// efficient accumulation operation which is exposed by RocksDB, used by
-// Cockroach for the efficient accumulation of certain values. Due to the
-// difficulty of making these operations transactional, merges are not currently
-// exposed directly to clients. Merged values are explicitly not MVCC data.
-func (r *Range) InternalMerge(batch engine.Engine, ms *engine.MVCCStats, args *proto.InternalMergeRequest, reply *proto.InternalMergeResponse) {
-	err := engine.MVCCMerge(batch, ms, args.Key, args.Value)
-	reply.SetGoError(err)
-}
-
-// InternalTruncateLog discards a prefix of the raft log.
-func (r *Range) InternalTruncateLog(batch engine.Engine, ms *engine.MVCCStats, args *proto.InternalTruncateLogRequest, reply *proto.InternalTruncateLogResponse) {
-	// args.Index is the first index to keep.
-	term, err := r.Term(args.Index - 1)
-	if err != nil {
-		reply.SetGoError(err)
-		return
-	}
-	start := engine.RaftLogKey(r.Desc().RaftID, args.Index).Next()
-	end := engine.RaftLogKey(r.Desc().RaftID, 0)
-	err = batch.Iterate(engine.MVCCEncodeKey(start), engine.MVCCEncodeKey(end),
-		func(kv proto.RawKeyValue) (bool, error) {
-			err := batch.Clear(kv.Key)
-			return false, err
-		})
-	if err != nil {
-		reply.SetGoError(err)
-		return
-	}
-	ts := proto.RaftTruncatedState{
-		Index: args.Index - 1,
-		Term:  term,
-	}
-	err = engine.MVCCPutProto(batch, ms, engine.RaftTruncatedStateKey(r.Desc().RaftID),
-		proto.ZeroTimestamp, nil, &ts)
-	reply.SetGoError(err)
-}
-
-// InternalLeaderLease evaluates and responds to a request to grant a leader lease.
-func (r *Range) InternalLeaderLease(args *proto.InternalLeaderLeaseRequest, reply *proto.InternalLeaderLeaseResponse) {
-	// TODO(tschottdorf)
-	// r.grantLeaderLease(args.Lease)
-}
-
-// requestLeaderLease sends a request to obtain or extend a leader lease for this
-// replica.
-func (r *Range) requestLeaderLease(term uint64) {
-	// Prepare a Raft command to get a leader lease for the replica
-	// of that group that lives in our store.
-	wallTime := r.rm.Clock().PhysicalNow()
-	// TODO: get this from configuration, either as a config flag
-	// or, later, dynamically adjusted.
-	duration := int64(defaultLeaderLeaseDuration)
-	idKey := makeCmdIDKey(proto.ClientCmdID{
-		WallTime: wallTime,
-		Random:   rand.Int63(),
-	})
-	cmd := proto.InternalRaftCommand{
-		RaftID: r.Desc().RaftID,
-	}
-	args := &proto.InternalLeaderLeaseRequest{
-		Lease: proto.Lease{
-			Expiration: wallTime + duration,
-			Duration:   duration,
-			Term:       term,
-			RaftNodeID: uint64(r.rm.RaftNodeID()),
-		},
-	}
-
-	cmd.Cmd.SetValue(args)
-
-	// Propose the Raft command.
-	errCh := r.rm.ProposeRaftCommand(idKey, cmd)
-
-	// Make sure we log a potential error from Raft.
-	r.stopper.RunWorker(func() {
-		select {
-		case err := <-errCh:
-			if err != nil {
-				log.Warning(err)
-			}
-		case <-r.stopper.ShouldStop():
-			return
-		}
-	})
 }
 
 // splitTrigger is called on a successful commit of an AdminSplit
@@ -1550,6 +1039,7 @@ func (r *Range) splitTrigger(batch engine.Engine, split *proto.SplitTrigger) err
 	if err != nil {
 		return err
 	}
+
 	// Compute stats for new range.
 	ms, err = engine.MVCCComputeStats(r.rm.Engine(), split.NewDesc.StartKey, split.NewDesc.EndKey, now.WallTime)
 	if err != nil {
@@ -1563,666 +1053,4 @@ func (r *Range) splitTrigger(batch engine.Engine, split *proto.SplitTrigger) err
 	r.Unlock()
 
 	return r.rm.SplitRange(r, newRng)
-}
-
-// mergeTrigger is called on a successful commit of an AdminMerge
-// transaction. It recomputes stats for the receiving range.
-func (r *Range) mergeTrigger(batch engine.Engine, merge *proto.MergeTrigger) error {
-	if !bytes.Equal(r.Desc().StartKey, merge.UpdatedDesc.StartKey) {
-		return util.Errorf("range and updated range start keys do not match: %s != %s",
-			r.Desc().StartKey, merge.UpdatedDesc.StartKey)
-	}
-
-	if !r.Desc().EndKey.Less(merge.UpdatedDesc.EndKey) {
-		return util.Errorf("range end key is not less than the post merge end key: %s < %s",
-			r.Desc().EndKey, merge.UpdatedDesc.StartKey)
-	}
-
-	if merge.SubsumedRaftID <= 0 {
-		return util.Errorf("subsumed raft ID must be provided: %d", merge.SubsumedRaftID)
-	}
-
-	// Copy the subsumed range's response cache to the subsuming one.
-	if err := r.respCache.CopyFrom(batch, merge.SubsumedRaftID); err != nil {
-		return util.Errorf("unable to copy response cache to new split range: %s", err)
-	}
-
-	// Compute stats for updated range.
-	now := r.rm.Clock().Timestamp()
-	ms, err := engine.MVCCComputeStats(r.rm.Engine(), merge.UpdatedDesc.StartKey,
-		merge.UpdatedDesc.EndKey, now.WallTime)
-	if err != nil {
-		return util.Errorf("unable to compute stats for the range after merge: %s", err)
-	}
-	r.stats.SetMVCCStats(batch, ms)
-
-	subsumedRng, err := r.rm.MergeRange(r, merge.UpdatedDesc.EndKey, merge.SubsumedRaftID)
-	if err == nil {
-		// Merge the timestamp caches from both ranges.
-		r.Lock()
-		subsumedRng.tsCache.MergeInto(r.tsCache, false /* clear */)
-		r.Unlock()
-	}
-	return err
-}
-
-func (r *Range) changeReplicasTrigger(change *proto.ChangeReplicasTrigger) error {
-	copy := *r.Desc()
-	copy.Replicas = change.UpdatedReplicas
-	r.SetDesc(&copy)
-	return nil
-}
-
-// InitialState implements the raft.Storage interface.
-func (r *Range) InitialState() (raftpb.HardState, raftpb.ConfState, error) {
-	var hs raftpb.HardState
-	found, err := engine.MVCCGetProto(r.rm.Engine(), engine.RaftHardStateKey(r.Desc().RaftID),
-		proto.ZeroTimestamp, true, nil, &hs)
-	if err != nil {
-		return raftpb.HardState{}, raftpb.ConfState{}, err
-	}
-	if !found {
-		// We don't have a saved HardState, so set up the defaults.
-		if r.isInitialized() {
-			// Set the initial log term.
-			hs.Term = raftInitialLogTerm
-			hs.Commit = raftInitialLogIndex
-
-			atomic.StoreUint64(&r.lastIndex, raftInitialLogIndex)
-		} else {
-			// This is a new range we are receiving from another node. Start
-			// from zero so we will receive a snapshot.
-			atomic.StoreUint64(&r.lastIndex, 0)
-		}
-	}
-
-	var cs raftpb.ConfState
-	for _, rep := range r.Desc().Replicas {
-		cs.Nodes = append(cs.Nodes, uint64(MakeRaftNodeID(rep.NodeID, rep.StoreID)))
-	}
-
-	return hs, cs, nil
-}
-
-// loadLastIndex looks in the engine to find the last log index.
-func (r *Range) loadLastIndex() error {
-	logKey := engine.RaftLogPrefix(r.Desc().RaftID)
-	// The log keys are encoded in descending order, so the first log
-	// entry in the database is the last one that was written.
-	kvs, err := engine.MVCCScan(r.rm.Engine(),
-		logKey, logKey.PrefixEnd(),
-		1, proto.ZeroTimestamp, true, nil)
-	if err != nil {
-		return err
-	}
-	if len(kvs) > 0 {
-		// The log is non-empty, so use the most recent entry's index.
-		// The index is encoded in both the key and the value.
-		var lastEnt raftpb.Entry
-		err := gogoproto.Unmarshal(kvs[0].Value.Bytes, &lastEnt)
-		if err != nil {
-			return err
-		}
-		atomic.StoreUint64(&r.lastIndex, lastEnt.Index)
-	} else if len(kvs) == 0 {
-		// The log is empty, which means we are either starting from scratch
-		// or the entire log has been truncated away. raftTruncatedState
-		// handles both cases.
-		ts, err := r.raftTruncatedState()
-		if err != nil {
-			return err
-		}
-		atomic.StoreUint64(&r.lastIndex, ts.Index)
-	}
-	return nil
-}
-
-// Entries implements the raft.Storage interface. Note that maxBytes is advisory
-// and this method will always return at least one entry even if it exceeds
-// maxBytes.
-// TODO(bdarnell): consider caching for recent entries, if rocksdb's builtin caching
-// is insufficient.
-func (r *Range) Entries(lo, hi, maxBytes uint64) ([]raftpb.Entry, error) {
-	// Scan over the log (which is stored backwards) to find the
-	// requested entries. Reversing [lo, hi) gives us (hi, lo]; since
-	// MVCCScan is inclusive in the other direction we must increment both the
-	// start and end keys.
-	kvs, err := engine.MVCCScan(r.rm.Engine(),
-		engine.RaftLogKey(r.Desc().RaftID, hi).Next(),
-		engine.RaftLogKey(r.Desc().RaftID, lo).Next(),
-		0, proto.ZeroTimestamp, true, nil)
-	if err != nil {
-		return nil, err
-	}
-	ents := make([]raftpb.Entry, 0, len(kvs))
-	for _, kv := range kvs {
-		var ent raftpb.Entry
-		err = gogoproto.Unmarshal(kv.Value.GetBytes(), &ent)
-		if err != nil {
-			return nil, err
-		}
-		ents = append(ents, ent)
-	}
-	if len(ents) != int(hi-lo) {
-		return nil, raft.ErrUnavailable
-	}
-	// Reverse the log to get it back into the proper order.
-	for i, j := 0, len(ents)-1; i < j; i, j = i+1, j-1 {
-		ents[i], ents[j] = ents[j], ents[i]
-	}
-
-	// TODO(bdarnell): apply the limit earlier instead of after loading everything.
-	size := ents[0].Size()
-	for i := 1; i < len(ents); i++ {
-		size += ents[i].Size()
-		if uint64(size) > maxBytes {
-			return ents[:i], nil
-		}
-	}
-
-	return ents, nil
-}
-
-// Term implements the raft.Storage interface.
-func (r *Range) Term(i uint64) (uint64, error) {
-	ents, err := r.Entries(i, i+1, 0)
-	if err == raft.ErrUnavailable {
-		ts, err := r.raftTruncatedState()
-		if err != nil {
-			return 0, err
-		}
-		if i == ts.Index {
-			return ts.Term, nil
-		}
-		return 0, raft.ErrUnavailable
-	} else if err != nil {
-		return 0, err
-	}
-	if len(ents) == 0 {
-		return 0, nil
-	}
-	return ents[0].Term, nil
-}
-
-// LastIndex implements the raft.Storage interface.
-func (r *Range) LastIndex() (uint64, error) {
-	return atomic.LoadUint64(&r.lastIndex), nil
-}
-
-// raftTruncatedState returns metadata about the log that preceded the first
-// current entry. This includes both entries that have been compacted away
-// and the dummy entries that make up the starting point of an empty log.
-func (r *Range) raftTruncatedState() (proto.RaftTruncatedState, error) {
-	ts := proto.RaftTruncatedState{}
-	ok, err := engine.MVCCGetProto(r.rm.Engine(), engine.RaftTruncatedStateKey(r.Desc().RaftID),
-		proto.ZeroTimestamp, true, nil, &ts)
-	if err != nil {
-		return ts, err
-	}
-	if !ok {
-		if r.isInitialized() {
-			// If we created this range, set the initial log index/term.
-			ts.Index = raftInitialLogIndex
-			ts.Term = raftInitialLogTerm
-		} else {
-			// This is a new range we are receiving from another node. Start
-			// from zero so we will receive a snapshot.
-			ts.Index = 0
-			ts.Term = 0
-		}
-	}
-	return ts, nil
-}
-
-// FirstIndex implements the raft.Storage interface.
-func (r *Range) FirstIndex() (uint64, error) {
-	ts, err := r.raftTruncatedState()
-	if err != nil {
-		return 0, err
-	}
-	return ts.Index + 1, nil
-}
-
-func loadAppliedIndex(eng engine.Engine, raftID int64) (uint64, error) {
-	appliedIndex := uint64(0)
-	v, err := engine.MVCCGet(eng, engine.RaftAppliedIndexKey(raftID),
-		proto.ZeroTimestamp, true, nil)
-	if err != nil {
-		return 0, err
-	}
-	if v != nil {
-		_, appliedIndex = encoding.DecodeUint64(v.Bytes)
-	}
-	return appliedIndex, nil
-}
-
-// Snapshot implements the raft.Storage interface.
-func (r *Range) Snapshot() (raftpb.Snapshot, error) {
-	// Copy all the data from a consistent RocksDB snapshot into a RaftSnapshotData.
-	snap := r.rm.NewSnapshot()
-	defer snap.Close()
-	var snapData proto.RaftSnapshotData
-
-	// Read the range metadata from the snapshot instead of the members
-	// of the Range struct because they might be changed concurrently.
-	appliedIndex, err := loadAppliedIndex(snap, r.Desc().RaftID)
-	if err != nil {
-		return raftpb.Snapshot{}, err
-	}
-	var desc proto.RangeDescriptor
-	// We ignore intents on the range descriptor (consistent=false) because we know
-	// they cannot be committed yet. (operations that modify range descriptors resolve their
-	// own intents when they commit).
-	ok, err := engine.MVCCGetProto(snap, engine.RangeDescriptorKey(r.Desc().StartKey),
-		r.rm.Clock().Now(), false, nil, &desc)
-	if err != nil {
-		return raftpb.Snapshot{}, util.Errorf("failed to get desc: %s", err)
-	} else if !ok {
-		return raftpb.Snapshot{}, util.Errorf("couldn't find range descriptor")
-	}
-
-	// Iterate over all the data in the range, including local-only data like
-	// the response cache.
-	for iter := newRangeDataIterator(r, snap); iter.Valid(); iter.Next() {
-		snapData.KV = append(snapData.KV,
-			&proto.RaftSnapshotData_KeyValue{Key: iter.Key(), Value: iter.Value()})
-	}
-
-	data, err := gogoproto.Marshal(&snapData)
-	if err != nil {
-		return raftpb.Snapshot{}, err
-	}
-
-	// Synthesize our raftpb.ConfState from desc.
-	var cs raftpb.ConfState
-	for _, rep := range desc.Replicas {
-		cs.Nodes = append(cs.Nodes, uint64(MakeRaftNodeID(rep.NodeID, rep.StoreID)))
-	}
-
-	term, err := r.Term(appliedIndex)
-	if err != nil {
-		return raftpb.Snapshot{}, err
-	}
-
-	return raftpb.Snapshot{
-		Data: data,
-		Metadata: raftpb.SnapshotMetadata{
-			Index:     appliedIndex,
-			Term:      term,
-			ConfState: cs,
-		},
-	}, nil
-}
-
-// Append implements the multiraft.WriteableGroupStorage interface.
-func (r *Range) Append(entries []raftpb.Entry) error {
-	batch := r.rm.Engine().NewBatch()
-	for _, ent := range entries {
-		err := engine.MVCCPutProto(batch, nil, engine.RaftLogKey(r.Desc().RaftID, ent.Index),
-			proto.ZeroTimestamp, nil, &ent)
-		if err != nil {
-			return err
-		}
-	}
-	// TODO(bdarnell): if the last entry's index < lastIndex, delete any remaining old entries.
-	err := batch.Commit()
-	if err != nil {
-		return err
-	}
-	atomic.StoreUint64(&r.lastIndex, entries[len(entries)-1].Index)
-	return nil
-}
-
-// ApplySnapshot implements the multiraft.WriteableGroupStorage interface.
-func (r *Range) ApplySnapshot(snap raftpb.Snapshot) error {
-	snapData := proto.RaftSnapshotData{}
-	err := gogoproto.Unmarshal(snap.Data, &snapData)
-	if err != nil {
-		return nil
-	}
-
-	// First, save the HardState.  The HardState must not be changed
-	// because it may record a previous vote cast by this node.
-	hardStateKey := engine.RaftHardStateKey(r.Desc().RaftID)
-	hardState, err := engine.MVCCGet(r.rm.Engine(), hardStateKey, proto.ZeroTimestamp, true, nil)
-	if err != nil {
-		return nil
-	}
-
-	batch := engine.NewBatch(r.rm.Engine())
-
-	// Delete everything in the range and recreate it from the snapshot.
-	for iter := newRangeDataIterator(r, r.rm.Engine()); iter.Valid(); iter.Next() {
-		if err := batch.Clear(iter.Key()); err != nil {
-			return err
-		}
-	}
-
-	// Write the snapshot into the range.
-	for _, kv := range snapData.KV {
-		if err := batch.Put(kv.Key, kv.Value); err != nil {
-			return err
-		}
-	}
-
-	// Restore the saved HardState.
-	if hardState == nil {
-		err := engine.MVCCDelete(batch, nil, hardStateKey, proto.ZeroTimestamp, nil)
-		if err != nil {
-			return err
-		}
-	} else {
-		err := engine.MVCCPut(batch, nil, hardStateKey, proto.ZeroTimestamp, *hardState, nil)
-		if err != nil {
-			return err
-		}
-	}
-
-	// Read the updated range descriptor.
-	var desc proto.RangeDescriptor
-	if _, err := engine.MVCCGetProto(batch, engine.RangeDescriptorKey(r.Desc().StartKey),
-		r.rm.Clock().Now(), false, nil, &desc); err != nil {
-		return err
-	}
-
-	if err := batch.Commit(); err != nil {
-		return err
-	}
-
-	// Save the descriptor and applied index to our member variables.
-	r.SetDesc(&desc)
-	atomic.StoreUint64(&r.appliedIndex, snap.Metadata.Index)
-
-	// TODO(bdarnell): extract the real last index.
-	// snap.Metadata.Index is the last applied index, but our snapshot may have given us
-	// some unapplied entries too. It's safe to set lastIndex too low (the entries will
-	// be re-sent), but it would be better to set this to the last entry in the log.
-	atomic.StoreUint64(&r.lastIndex, snap.Metadata.Index)
-	return err
-}
-
-// SetHardState implements the multiraft.WriteableGroupStorage interface.
-func (r *Range) SetHardState(st raftpb.HardState) error {
-	return engine.MVCCPutProto(r.rm.Engine(), nil, engine.RaftHardStateKey(r.Desc().RaftID),
-		proto.ZeroTimestamp, nil, &st)
-}
-
-// AdminSplit divides the range into into two ranges, using either
-// args.SplitKey (if provided) or an internally computed key that aims to
-// roughly equipartition the range by size. The split is done inside of
-// a distributed txn which writes updated and new range descriptors, and
-// updates the range addressing metadata. The handover of responsibility for
-// the reassigned key range is carried out seamlessly through a split trigger
-// carried out as part of the commit of that transaction.
-func (r *Range) AdminSplit(args *proto.AdminSplitRequest, reply *proto.AdminSplitResponse) {
-	// Only allow a single split per range at a time.
-	r.metaLock.Lock()
-	defer r.metaLock.Unlock()
-
-	// Determine split key if not provided with args. This scan is
-	// allowed to be relatively slow because admin commands don't block
-	// other commands.
-	desc := r.Desc()
-	splitKey := proto.Key(args.SplitKey)
-	if len(splitKey) == 0 {
-		snap := r.rm.NewSnapshot()
-		defer snap.Close()
-		var err error
-		if splitKey, err = engine.MVCCFindSplitKey(snap, desc.RaftID, desc.StartKey, desc.EndKey); err != nil {
-			reply.SetGoError(util.Errorf("unable to determine split key: %s", err))
-			return
-		}
-	}
-
-	// Verify some properties of split key.
-	if !r.ContainsKey(splitKey) {
-		reply.SetGoError(proto.NewRangeKeyMismatchError(splitKey, splitKey, desc))
-		return
-	}
-	if !engine.IsValidSplitKey(splitKey) {
-		reply.SetGoError(util.Errorf("cannot split range at key %s", splitKey))
-		return
-	}
-	if splitKey.Equal(desc.StartKey) || splitKey.Equal(desc.EndKey) {
-		reply.SetGoError(util.Errorf("range has already been split by key %s", splitKey))
-		return
-	}
-
-	// Create new range descriptor with newly-allocated replica IDs and Raft IDs.
-	newDesc, err := r.rm.NewRangeDescriptor(splitKey, desc.EndKey, desc.Replicas)
-	if err != nil {
-		reply.SetGoError(util.Errorf("unable to allocate new range descriptor: %s", err))
-		return
-	}
-
-	// Init updated version of existing range descriptor.
-	updatedDesc := *desc
-	updatedDesc.EndKey = splitKey
-
-	log.Infof("initiating a split of range %d %s-%s at key %s", desc.RaftID,
-		proto.Key(desc.StartKey), proto.Key(desc.EndKey), splitKey)
-
-	txnOpts := &client.TransactionOptions{
-		Name: fmt.Sprintf("split range %d at %s", desc.RaftID, splitKey),
-	}
-	if err = r.rm.DB().RunTransaction(txnOpts, func(txn *client.KV) error {
-		// Create range descriptor for second half of split.
-		// Note that this put must go first in order to locate the
-		// transaction record on the correct range.
-		desc1Key := engine.RangeDescriptorKey(newDesc.StartKey)
-		if err := txn.PreparePutProto(desc1Key, newDesc); err != nil {
-			return err
-		}
-		// Update existing range descriptor for first half of split.
-		desc2Key := engine.RangeDescriptorKey(updatedDesc.StartKey)
-		if err := txn.PreparePutProto(desc2Key, &updatedDesc); err != nil {
-			return err
-		}
-		// Update range descriptor addressing record(s).
-		if err := SplitRangeAddressing(txn, newDesc, &updatedDesc); err != nil {
-			return err
-		}
-		// Update the RangeTree.
-		if err := InsertRange(txn, newDesc.StartKey); err != nil {
-			return err
-		}
-		// End the transaction manually, instead of letting RunTransaction
-		// loop do it, in order to provide a split trigger.
-		return txn.Call(proto.EndTransaction, &proto.EndTransactionRequest{
-			RequestHeader: proto.RequestHeader{Key: args.Key},
-			Commit:        true,
-			InternalCommitTrigger: &proto.InternalCommitTrigger{
-				SplitTrigger: &proto.SplitTrigger{
-					UpdatedDesc: updatedDesc,
-					NewDesc:     *newDesc,
-				},
-				Intents: []proto.Key{desc1Key, desc2Key},
-			},
-		}, &proto.EndTransactionResponse{})
-	}); err != nil {
-		reply.SetGoError(util.Errorf("split at key %s failed: %s", splitKey, err))
-	}
-}
-
-// ReplicaSetsEqual is used in AdminMerge to ensure that the ranges are
-// all collocate on the same set of replicas.
-func ReplicaSetsEqual(a, b []proto.Replica) bool {
-	if len(a) != len(b) {
-		return false
-	}
-
-	set := make(map[proto.StoreID]int)
-	for _, replica := range a {
-		set[replica.StoreID]++
-	}
-
-	for _, replica := range b {
-		set[replica.StoreID]--
-	}
-
-	for _, value := range set {
-		if value != 0 {
-			return false
-		}
-	}
-
-	return true
-}
-
-// AdminMerge extends the range to subsume the range that comes next in
-// the key space. The range being subsumed is provided in args.SubsumedRange.
-// The EndKey of the subsuming range must equal the start key of the
-// range being subsumed. The merge is performed inside of a distributed
-// transaction which writes the updated range descriptor for the subsuming range
-// and deletes the range descriptor for the subsumed one. It also updates the
-// range addressing metadata. The handover of responsibility for
-// the reassigned key range is carried out seamlessly through a merge trigger
-// carried out as part of the commit of that transaction.
-// A merge requires that the two ranges are collocate on the same set of replicas.
-func (r *Range) AdminMerge(args *proto.AdminMergeRequest, reply *proto.AdminMergeResponse) {
-	// Only allow a single split/merge per range at a time.
-	r.metaLock.Lock()
-	defer r.metaLock.Unlock()
-
-	// Lookup subsumed range.
-	desc := r.Desc()
-	if desc.EndKey.Equal(proto.KeyMax) {
-		// Noop.
-		return
-	}
-	subsumedRng := r.rm.LookupRange(desc.EndKey, desc.EndKey)
-	if subsumedRng == nil {
-		reply.SetGoError(util.Errorf("ranges not collocated; migration of ranges in anticipation of merge not yet implemented"))
-		return
-	}
-	subsumedDesc := subsumedRng.Desc()
-
-	// Make sure the range being subsumed follows this one.
-	if !bytes.Equal(desc.EndKey, subsumedDesc.StartKey) {
-		reply.SetGoError(util.Errorf("Ranges that are not adjacent cannot be merged, %s != %s",
-			desc.EndKey, subsumedDesc.StartKey))
-		return
-	}
-
-	// Ensure that both ranges are collocate by intersecting the store ids from
-	// their replicas.
-	if !ReplicaSetsEqual(subsumedDesc.GetReplicas(), desc.GetReplicas()) {
-		reply.SetGoError(util.Error("The two ranges replicas are not collocate"))
-		return
-	}
-
-	// Init updated version of existing range descriptor.
-	updatedDesc := *desc
-	updatedDesc.EndKey = subsumedDesc.EndKey
-
-	log.Infof("initiating a merge of range %d %s-%s into range %d %s-%s",
-		subsumedDesc.RaftID, proto.Key(subsumedDesc.StartKey), proto.Key(subsumedDesc.EndKey),
-		desc.RaftID, desc.StartKey, desc.EndKey)
-
-	txnOpts := &client.TransactionOptions{
-		Name: fmt.Sprintf("merge range %d into %d", subsumedDesc.RaftID, desc.RaftID),
-	}
-	if err := r.rm.DB().RunTransaction(txnOpts, func(txn *client.KV) error {
-		// Update the range descriptor for the receiving range.
-		desc1Key := engine.RangeDescriptorKey(updatedDesc.StartKey)
-		if err := txn.PreparePutProto(desc1Key, &updatedDesc); err != nil {
-			return err
-		}
-
-		// Remove the range descriptor for the deleted range.
-		desc2Key := engine.RangeDescriptorKey(subsumedDesc.StartKey)
-		deleteResponse := &proto.DeleteResponse{}
-		txn.Prepare(proto.Delete, proto.DeleteArgs(desc2Key),
-			deleteResponse)
-
-		if err := MergeRangeAddressing(txn, desc, &updatedDesc); err != nil {
-			return err
-		}
-
-		// End the transaction manually instead of letting RunTransaction
-		// loop do it, in order to provide a merge trigger.
-		return txn.Call(proto.EndTransaction, &proto.EndTransactionRequest{
-			RequestHeader: proto.RequestHeader{Key: args.Key},
-			Commit:        true,
-			InternalCommitTrigger: &proto.InternalCommitTrigger{
-				MergeTrigger: &proto.MergeTrigger{
-					UpdatedDesc:    updatedDesc,
-					SubsumedRaftID: subsumedDesc.RaftID,
-				},
-				Intents: []proto.Key{desc1Key, desc2Key},
-			},
-		}, &proto.EndTransactionResponse{})
-	}); err != nil {
-		reply.SetGoError(util.Errorf("merge of range %d into %d failed: %s",
-			subsumedDesc.RaftID, desc.RaftID, err))
-	}
-}
-
-// ChangeReplicas adds or removes a replica of a range. The change is performed
-// in a distributed transaction and takes effect when that transaction is committed.
-// When removing a replica, only the NodeID and StoreID fields of the Replica are used.
-func (r *Range) ChangeReplicas(changeType proto.ReplicaChangeType, replica proto.Replica) error {
-	// Only allow a single change per range at a time.
-	r.metaLock.Lock()
-	defer r.metaLock.Unlock()
-
-	// Validate the request and prepare the new descriptor.
-	desc := r.Desc()
-	updatedDesc := *desc
-	updatedDesc.Replicas = append([]proto.Replica{}, desc.Replicas...)
-	found := -1
-	for i, existingRep := range desc.Replicas {
-		if existingRep.NodeID == replica.NodeID && existingRep.StoreID == replica.StoreID {
-			found = i
-			break
-		}
-	}
-	if changeType == proto.ADD_REPLICA {
-		if found != -1 {
-			return util.Errorf("adding replica %v which is already present in range %d",
-				replica, desc.RaftID)
-		}
-		updatedDesc.Replicas = append(updatedDesc.Replicas, replica)
-	} else if changeType == proto.REMOVE_REPLICA {
-		if found == -1 {
-			return util.Errorf("removing replica %v which is not present in range %d",
-				replica, desc.RaftID)
-		}
-		updatedDesc.Replicas[found] = updatedDesc.Replicas[len(updatedDesc.Replicas)-1]
-		updatedDesc.Replicas = updatedDesc.Replicas[:len(updatedDesc.Replicas)-1]
-	}
-
-	txnOpts := &client.TransactionOptions{
-		Name: fmt.Sprintf("change replicas of %d", desc.RaftID),
-	}
-	err := r.rm.DB().RunTransaction(txnOpts, func(txn *client.KV) error {
-		// Important: the range descriptor must be the first thing touched in the transaction
-		// so the transaction record is co-located with the range being modified.
-		descKey := engine.RangeDescriptorKey(updatedDesc.StartKey)
-		if err := txn.PreparePutProto(descKey, &updatedDesc); err != nil {
-			return err
-		}
-
-		// TODO(bdarnell): call UpdateRangeAddressing
-
-		// End the transaction manually instead of letting RunTransaction
-		// loop do it, in order to provide a commit trigger.
-		return txn.Call(proto.EndTransaction, &proto.EndTransactionRequest{
-			RequestHeader: proto.RequestHeader{Key: updatedDesc.StartKey},
-			Commit:        true,
-			InternalCommitTrigger: &proto.InternalCommitTrigger{
-				ChangeReplicasTrigger: &proto.ChangeReplicasTrigger{
-					NodeID:          replica.NodeID,
-					StoreID:         replica.StoreID,
-					ChangeType:      changeType,
-					UpdatedReplicas: updatedDesc.Replicas,
-				},
-				Intents: []proto.Key{descKey},
-			},
-		}, &proto.EndTransactionResponse{})
-	})
-	if err != nil {
-		return util.Errorf("change replicas of %d failed: %s", desc.RaftID, err)
-	}
-	return nil
 }

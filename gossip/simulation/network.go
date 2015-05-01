@@ -24,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/gossip"
 	"github.com/cockroachdb/cockroach/proto"
 	"github.com/cockroachdb/cockroach/rpc"
+	"github.com/cockroachdb/cockroach/security"
 	"github.com/cockroachdb/cockroach/util"
 	"github.com/cockroachdb/cockroach/util/hlc"
 	"github.com/cockroachdb/cockroach/util/log"
@@ -56,9 +57,9 @@ type Network struct {
 func NewNetwork(nodeCount int, networkType string,
 	gossipInterval time.Duration) *Network {
 
-	tlsConfig := rpc.LoadInsecureTLSConfig()
+	tlsConfig := security.LoadInsecureTLSConfig()
 	clock := hlc.NewClock(hlc.UnixNano)
-	rpcContext := rpc.NewContext(clock, tlsConfig)
+	rpcContext := rpc.NewContext(clock, tlsConfig, nil)
 
 	log.Infof("simulating gossip network with %d nodes", nodeCount)
 	servers := make([]*rpc.Server, nodeCount)
@@ -75,7 +76,7 @@ func NewNetwork(nodeCount int, networkType string,
 	nodes := make([]*Node, nodeCount)
 	for i := 0; i < nodeCount; i++ {
 		// Build new resolvers for each instance or we'll get data races.
-		var bootstrap []*gossip.Resolver
+		var bootstrap []gossip.Resolver
 		for i, addr := range addrs {
 			if i >= 3 {
 				break
@@ -84,7 +85,13 @@ func NewNetwork(nodeCount int, networkType string,
 		}
 
 		node := gossip.New(rpcContext, gossipInterval, bootstrap)
-		node.SetNodeID(proto.NodeID(i))
+		node.SetNodeDescriptor(&proto.NodeDescriptor{
+			NodeID: proto.NodeID(i + 1),
+			Address: proto.Addr{
+				Network: addrs[i].Network(),
+				Address: addrs[i].String(),
+			},
+		})
 		node.Start(servers[i], stopper)
 		stopper.AddCloser(servers[i])
 		// Node 0 gossips node count.
@@ -108,6 +115,17 @@ func NewNetwork(nodeCount int, networkType string,
 func (n *Network) GetNodeFromAddr(addr string) (*Node, bool) {
 	for i := 0; i < len(n.Nodes); i++ {
 		if n.Nodes[i].Addr.String() == addr {
+			return n.Nodes[i], true
+		}
+	}
+	return nil, false
+}
+
+// GetNodeFromID returns the simulation node associated with
+// provided node ID, or nil if there is no such node.
+func (n *Network) GetNodeFromID(nodeID proto.NodeID) (*Node, bool) {
+	for i := 0; i < len(n.Nodes); i++ {
+		if n.Nodes[i].Gossip.GetNodeID() == nodeID {
 			return n.Nodes[i], true
 		}
 	}

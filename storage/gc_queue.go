@@ -22,6 +22,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cockroachdb/cockroach/client"
 	"github.com/cockroachdb/cockroach/gossip"
 	"github.com/cockroachdb/cockroach/proto"
 	"github.com/cockroachdb/cockroach/storage/engine"
@@ -68,15 +69,15 @@ func newGCQueue() *gcQueue {
 	return gcq
 }
 
+func (gcq *gcQueue) needsLeaderLease() bool {
+	return true
+}
+
 // shouldQueue determines whether a range should be queued for garbage
 // collection, and if so, at what priority. Returns true for shouldQ
 // in the event that the cumulative ages of GC'able bytes or extant
 // intents exceed thresholds.
 func (gcq *gcQueue) shouldQueue(now proto.Timestamp, rng *Range) (shouldQ bool, priority float64) {
-	// Only queue for GC if this replica is leader.
-	if !rng.IsLeader() {
-		return
-	}
 	// Lookup GC policy for this range.
 	policy, err := gcq.lookupGCPolicy(rng)
 	if err != nil {
@@ -107,11 +108,6 @@ func (gcq *gcQueue) shouldQueue(now proto.Timestamp, rng *Range) (shouldQ bool, 
 // batched into InternalGC calls. Extant intents are resolved if
 // intents are older than intentAgeThreshold.
 func (gcq *gcQueue) process(now proto.Timestamp, rng *Range) error {
-	if !rng.IsLeader() {
-		log.Infof("not leader of range %s; skipping GC", rng)
-		return nil
-	}
-
 	snap := rng.rm.Engine().NewSnapshot()
 	iter := newRangeDataIterator(rng, snap)
 	defer iter.Close()
@@ -220,7 +216,7 @@ func (gcq *gcQueue) process(now proto.Timestamp, rng *Range) error {
 
 	// Send GC request through range.
 	gcArgs.GCMeta = *gcMeta
-	if err := rng.AddCmd(proto.InternalGC, gcArgs, &proto.InternalGCResponse{}, true); err != nil {
+	if err := rng.AddCmd(gcArgs, &proto.InternalGCResponse{}, true); err != nil {
 		return err
 	}
 
@@ -264,7 +260,7 @@ func (gcq *gcQueue) resolveIntent(rng *Range, key proto.Key, meta *proto.MVCCMet
 		Abort:     true,
 	}
 	pushReply := &proto.InternalPushTxnResponse{}
-	if err := rng.rm.DB().Call(proto.InternalPushTxn, pushArgs, pushReply); err != nil {
+	if err := rng.rm.DB().Run(client.Call{Args: pushArgs, Reply: pushReply}); err != nil {
 		log.Warningf("push of txn %s failed: %s", meta.Txn, err)
 		updateOldestIntent(meta.Timestamp.WallTime)
 		return
@@ -279,7 +275,7 @@ func (gcq *gcQueue) resolveIntent(rng *Range, key proto.Key, meta *proto.MVCCMet
 			Txn:       pushReply.PusheeTxn,
 		},
 	}
-	if err := rng.AddCmd(proto.InternalResolveIntent, resolveArgs, &proto.InternalResolveIntentResponse{}, true); err != nil {
+	if err := rng.AddCmd(resolveArgs, &proto.InternalResolveIntentResponse{}, true); err != nil {
 		log.Warningf("resolve of key %q failed: %s", key, err)
 		updateOldestIntent(meta.Timestamp.WallTime)
 	}

@@ -18,12 +18,12 @@
 package storage
 
 import (
+	"sync"
 	"sync/atomic"
 	"time"
 	"unsafe"
 
 	"github.com/cockroachdb/cockroach/proto"
-	"github.com/cockroachdb/cockroach/storage/engine"
 	"github.com/cockroachdb/cockroach/util"
 	"github.com/cockroachdb/cockroach/util/hlc"
 	"github.com/cockroachdb/cockroach/util/log"
@@ -64,7 +64,7 @@ type rangeIterator interface {
 // aggregation of MVCC stats across all ranges in the store.
 type storeStats struct {
 	RangeCount int
-	MVCC       engine.MVCCStats
+	MVCC       proto.MVCCStats
 }
 
 // A rangeScanner iterates over ranges at a measured pace in order to
@@ -75,18 +75,25 @@ type rangeScanner struct {
 	iter     rangeIterator  // Iterator to implement scan of ranges
 	queues   []rangeQueue   // Range queues managed by this scanner
 	removed  chan *Range    // Ranges to remove from queues
-	count    int64          // Count of times through the scanning loop
 	stats    unsafe.Pointer // Latest store stats object; updated atomically
+	scanFn   func()         // Function called at each complete scan iteration
+	// Count of times through the scanning loop but locked by the completedScan
+	// mutex.
+	completedScan *sync.Cond
+	count         int64
 }
 
-// newRangeScanner creates a new range scanner with the provided
-// loop interval, range iterator, and range queues.
-func newRangeScanner(interval time.Duration, iter rangeIterator) *rangeScanner {
+// newRangeScanner creates a new range scanner with the provided loop interval,
+// range iterator, and range queues.  If scanFn is not nil, after a complete
+// loop that function will be called.
+func newRangeScanner(interval time.Duration, iter rangeIterator, scanFn func()) *rangeScanner {
 	return &rangeScanner{
-		interval: interval,
-		iter:     iter,
-		removed:  make(chan *Range, 10),
-		stats:    unsafe.Pointer(&storeStats{RangeCount: iter.EstimatedCount()}),
+		interval:      interval,
+		iter:          iter,
+		removed:       make(chan *Range, 10),
+		stats:         unsafe.Pointer(&storeStats{RangeCount: iter.EstimatedCount()}),
+		scanFn:        scanFn,
+		completedScan: sync.NewCond(&sync.Mutex{}),
 	}
 }
 
@@ -115,7 +122,9 @@ func (rs *rangeScanner) Stats() storeStats {
 // Count returns the number of times the scanner has cycled through
 // all ranges.
 func (rs *rangeScanner) Count() int64 {
-	return atomic.LoadInt64(&rs.count)
+	rs.completedScan.L.Lock()
+	defer rs.completedScan.L.Unlock()
+	return rs.count
 }
 
 // RemoveRange removes a range from any range queues the scanner may
@@ -123,6 +132,34 @@ func (rs *rangeScanner) Count() int64 {
 // when a range is removed (e.g. rebalanced or merged).
 func (rs *rangeScanner) RemoveRange(rng *Range) {
 	rs.removed <- rng
+}
+
+// WaitForScanCompletion waits until the end of the next scan and returns the
+// total number of scans completed so far.
+func (rs *rangeScanner) WaitForScanCompletion() int64 {
+	rs.completedScan.L.Lock()
+	defer rs.completedScan.L.Unlock()
+	initalValue := rs.count
+	for rs.count == initalValue {
+		rs.completedScan.Wait()
+	}
+	return rs.count
+}
+
+// paceInterval returns a duration between iterations to allow us to pace
+// the scan.
+func (rs *rangeScanner) paceInterval(start, now time.Time) time.Duration {
+	elapsed := now.Sub(start)
+	remainingNanos := rs.interval.Nanoseconds() - elapsed.Nanoseconds()
+	if remainingNanos < 0 {
+		remainingNanos = 0
+	}
+	count := rs.iter.EstimatedCount()
+	if count < 1 {
+		count = 1
+	}
+	interval := time.Duration(remainingNanos / int64(count))
+	return interval
 }
 
 // scanLoop loops endlessly, scanning through ranges available via
@@ -134,19 +171,10 @@ func (rs *rangeScanner) scanLoop(clock *hlc.Clock, stopper *util.Stopper) {
 		stats := &storeStats{}
 
 		for {
-			elapsed := time.Now().Sub(start)
-			remainingNanos := rs.interval.Nanoseconds() - elapsed.Nanoseconds()
-			if remainingNanos < 0 {
-				remainingNanos = 0
-			}
-			nextIteration := time.Duration(remainingNanos)
-			if count := rs.iter.EstimatedCount(); count > 0 {
-				nextIteration = time.Duration(remainingNanos / int64(count))
-			}
-			log.V(6).Infof("next range scan iteration in %s", nextIteration)
-
+			waitInterval := rs.paceInterval(start, time.Now())
+			log.V(6).Infof("Wait time interval set to %s", waitInterval)
 			select {
-			case <-time.After(nextIteration):
+			case <-time.After(waitInterval):
 				if !stopper.StartTask() {
 					continue
 				}
@@ -157,16 +185,23 @@ func (rs *rangeScanner) scanLoop(clock *hlc.Clock, stopper *util.Stopper) {
 						q.MaybeAdd(rng, clock.Now())
 					}
 					stats.RangeCount++
-					stats.MVCC.Accumulate(rng.stats.GetMVCC())
+					ms := rng.stats.GetMVCC()
+					stats.MVCC.Accumulate(&ms)
 				} else {
 					// Otherwise, we're done with the iteration. Reset iteration and start time.
 					rs.iter.Reset()
 					start = time.Now()
-					// Increment iteration counter.
-					atomic.AddInt64(&rs.count, 1)
 					// Store the most recent scan results in the scanner's stats.
 					atomic.StorePointer(&rs.stats, unsafe.Pointer(stats))
 					stats = &storeStats{}
+					if rs.scanFn != nil {
+						rs.scanFn()
+					}
+					// Increment iteration count.
+					rs.completedScan.L.Lock()
+					rs.count++
+					rs.completedScan.Broadcast()
+					rs.completedScan.L.Unlock()
 					log.V(6).Infof("reset range scan iteration")
 				}
 				stopper.FinishTask()

@@ -1,8 +1,9 @@
-# Cockroach [![Circle CI](https://circleci.com/gh/cockroachdb/cockroach.svg?style=svg)](https://circleci.com/gh/cockroachdb/cockroach) [![GoDoc](https://godoc.org/github.com/cockroachdb/cockroach?status.png)](https://godoc.org/github.com/cockroachdb/cockroach) ![Project Status](http://img.shields.io/badge/status-alpha-red.svg)
+![logo](/resource/doc/cockroach_db.png?raw=true "Cockroach Labs logo")
+
+
+[![Circle CI](https://circleci.com/gh/cockroachdb/cockroach.svg?style=svg)](https://circleci.com/gh/cockroachdb/cockroach) [![GoDoc](https://godoc.org/github.com/cockroachdb/cockroach?status.png)](https://godoc.org/github.com/cockroachdb/cockroach) ![Project Status](http://img.shields.io/badge/status-alpha-red.svg)
 
 ## A Scalable, Geo-Replicated, Transactional Datastore
-
-<img align="right" src="/resource/doc/color_cockroach.png?raw=true"/>
 
 **Table of Contents**
 
@@ -56,11 +57,32 @@ docker run -t -i -p 8080:8080 cockroachdb/cockroach shell
 # root@82cb657cdc42:/cockroach#
 ```
 
+If the docker command fails but Docker is installed, you probably need to initialize it. Here's a common error message:
+```bash
+FATA[0000] Post http:///var/run/docker.sock/v1.17/images/create?fromImage=cockroachdb%2Fcockroach%3Alatest: dial unix /var/run/docker.sock: no such file or directory
+```
+On OSX:
+```bash
+# Setup Boot2Docker. This should only need to be done once.
+boot2docker init
+# Start Boot2Docker. This will need to be run once per reboot.
+boot2docker start
+# Setup environment variables. This will need to be run once per shell.
+$(boot2docker shellinit)
+```
+Other operating systems will have a similar set of commands. Please check Docker's documentation for more info.
+
+
 Now we're in an environment that has everything set up, and we start by first initializing the cluster and then firing up the node:
 
 ```bash
 DIR=$(mktemp -d /tmp/dbXXX)
-./cockroach init $DIR
+# Initialize CA and server certificates. Default directory is -certs=certs
+./cockroach create-ca-cert
+./cockroach create-node-cert 127.0.0.1 localhost $(hostname)
+# Initialize data directories.
+./cockroach init -stores ssd=$DIR
+# Start the server.
 ./cockroach start -stores ssd="$DIR" -gossip self:// &
 ```
 This initializes and starts a single-node cluster in the background.
@@ -100,7 +122,7 @@ Check out `./cockroach help` to see all available commands.
 ##### REST
 
 Cockroach also exposes a REST API. You can use the [REST Explorer at
-localhost:8080](http://localhost:8080/#rest-explorer) or talk directly to it.
+localhost:8080](https://localhost:8080/#rest-explorer) or talk directly to it.
 
 Note that if you're using the Docker container, you want to do this in a new shell
 and not inside the container, which does not have cURL installed. Note also that
@@ -108,14 +130,14 @@ if you're using boot2docker, you don't want to curl `localhost` - find out
 the correct endpoint using `boot2docker ip`.
 
 ```bash
-curl -X POST -d "Hello" http://localhost:8080/kv/rest/entry/Cockroach
+curl -k -X POST -d "Hello" https://localhost:8080/kv/rest/entry/Cockroach
 ```
 ```json
 {"header":{"timestamp":{"wall_time":1416616834949813367,"logical":0}}}
 ```
 
 ```bash
-curl http://localhost:8080/kv/rest/entry/Cockroach
+curl -k https://localhost:8080/kv/rest/entry/Cockroach
 ```
 ```json
 {"header":{"timestamp":{"wall_time":1416616886486257568,"logical":0}},"value":{"bytes":"SGVsbG8=","timestamp":{"wall_time":1416616834949813367,"logical":0}}}
@@ -124,7 +146,7 @@ Note that `SGVsbG8=` equals `base64("Hello")`.
 
 Among other things, you can also scan a key range:
 ```bash
-curl "http://localhost:8080/kv/rest/range/?start=Ca&end=Cozz&limit=10"
+curl -k "https://localhost:8080/kv/rest/range/?start=Ca&end=Cozz&limit=10"
 ```
 ```json
 {"header":{"timestamp":{"wall_time":1416617120031733436,"logical":0}},"rows":[{"key":"Q29ja3JvYWNo","value":{"bytes":"SGVsbG8=","timestamp":{"wall_time":1416616834949813367,"logical":0}}}]}
@@ -144,11 +166,16 @@ Once you've built your image, you may want to run the tests:
 * `docker run "cockroachdb/cockroach-dev" test`
 * `make acceptance`
 
-Assuming you've built `cockroachdb/cockroach`, let's run a simple Cockroach node in the background:
+Assuming you've built `cockroachdb/cockroach`, let's run a simple Cockroach node:
 
 ```bash
-docker run -p 8080:8080 -v /data cockroachdb/cockroach init /data
-docker run -p 8080:8080 -d --volumes-from=$(docker ps -q -n 1) cockroachdb/cockroach start -stores ssd=/data -gossip self://
+docker run -v /data -v /certs cockroachdb/cockroach init -stores ssd=/data
+docker run --volumes-from=$(docker ps -q -n 1) cockroachdb/cockroach \
+  create-ca-cert -certs /certs
+docker run --volumes-from=$(docker ps -q -n 1) cockroachdb/cockroach \
+  create-node-cert -certs /certs 127.0.0.1 localhost roachnode
+docker run -p 8080:8080 -h roachnode --volumes-from=$(docker ps -q -n 1) \
+  cockroachdb/cockroach start -certs /certs -stores ssd=/data -gossip self://
 ```
 
 Run `docker run cockroachdb/cockroach help` to get an overview over the available commands and settings, and see [Running Cockroach](#running-cockroach) for first steps on interacting with your new node.

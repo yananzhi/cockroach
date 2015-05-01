@@ -22,13 +22,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cockroachdb/cockroach/proto"
 	"github.com/cockroachdb/cockroach/util"
 	"github.com/cockroachdb/cockroach/util/leaktest"
 	"github.com/cockroachdb/cockroach/util/log"
-	"github.com/coreos/etcd/Godeps/_workspace/src/golang.org/x/net/context"
 	"github.com/coreos/etcd/raft"
 	"github.com/coreos/etcd/raft/raftpb"
+	"golang.org/x/net/context"
 )
 
 var testRand, _ = util.NewPseudoRand()
@@ -73,7 +72,6 @@ func newTestCluster(transport Transport, size int, stopper *util.Stopper, t *tes
 			t.Fatal(err)
 		}
 		state := newState(mr)
-		state.clock = makeClock(0)
 		demux := newEventDemux(state.Events)
 		demux.start(stopper)
 		cluster.nodes = append(cluster.nodes, state)
@@ -195,15 +193,14 @@ func TestLeaderElectionEvent(t *testing.T) {
 	groupID := uint64(1)
 	cluster.createGroup(groupID, 0, 3)
 
-	// Send a Ready with a new leader but no new commits.
+	// Process a Ready with a new leader but no new commits.
 	// This happens while an election is in progress.
-	cluster.nodes[1].handleRaftReady(map[uint64]raft.Ready{
-		groupID: {
+	cluster.nodes[1].maybeSendLeaderEvent(groupID, cluster.nodes[1].groups[groupID],
+		&raft.Ready{
 			SoftState: &raft.SoftState{
 				Lead: 3,
 			},
-		},
-	})
+		})
 
 	// No events are sent.
 	select {
@@ -218,12 +215,11 @@ func TestLeaderElectionEvent(t *testing.T) {
 		Index: 42,
 		Term:  42,
 	}
-	cluster.nodes[1].handleRaftReady(map[uint64]raft.Ready{
-		groupID: {
+	cluster.nodes[1].maybeSendLeaderEvent(groupID, cluster.nodes[1].groups[groupID],
+		&raft.Ready{
 			Entries:          []raftpb.Entry{entry},
 			CommittedEntries: []raftpb.Entry{entry},
-		},
-	})
+		})
 
 	// Now we get an event.
 	select {
@@ -260,94 +256,6 @@ func TestCommand(t *testing.T) {
 		if string(commit.Command) != "command" {
 			t.Errorf("unexpected value in committed command: %v", commit.Command)
 		}
-	}
-}
-
-func makeClock(i int) func() int64 {
-	return func() int64 {
-		return int64(i)
-	}
-}
-
-func TestLeaderLease(t *testing.T) {
-	defer leaktest.AfterTest(t)
-	stopper := util.NewStopper()
-	cluster := newTestCluster(nil, 3, stopper, t)
-	defer stopper.Stop()
-	groupID := uint64(1)
-	cluster.createGroup(groupID, 0, 3)
-
-	// Set up the local clocks.
-	for i := 0; i < 3; i++ {
-		cluster.nodes[i].clock = makeClock(100 * (1 + i))
-	}
-
-	cluster.triggerElection(0, groupID)
-	election := cluster.waitForElection(0)
-	for i := 1; i < len(cluster.nodes); i++ {
-		cluster.waitForElection(i)
-	}
-
-	expiration := int64(1000)
-	duration := int64(500)
-	// Manually cook up the request the range would otherwise send.
-	leaseCmd := proto.InternalRaftCommand{RaftID: int64(groupID)}
-	leaseCmd.Cmd.SetValue(&proto.InternalLeaderLeaseRequest{
-		Lease: proto.Lease{
-			Expiration: expiration,
-			Duration:   duration,
-			Term:       election.Term,
-		},
-	})
-
-	command, err := leaseCmd.Marshal()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	cmdID := makeCommandID()
-	cluster.nodes[0].SubmitCommand(groupID, cmdID, command)
-
-	// Wait for progress on all nodes.
-	for i := 0; i < len(cluster.nodes); i++ {
-		commit := <-cluster.events[i].CommandCommitted
-		if commit.CommandID != cmdID {
-			t.Errorf("got unexpected committed command: %v", commit)
-		}
-		expExpiration := int64((i+1)*100) + duration
-		if actExpiration := cluster.nodes[i].groups[commit.GroupID].leaseGrantedUntil; actExpiration != expExpiration {
-			t.Errorf("node %d: expected lease expiry at %d, got %d",
-				i, expExpiration, actExpiration)
-		}
-	}
-
-	// Advance the first node's clock sufficiently to invalidate the lease.
-	cluster.nodes[0].clock = makeClock(int(cluster.nodes[0].clock() + duration + 1))
-	// Same for the second one.
-	cluster.nodes[1].clock = makeClock(int(cluster.nodes[1].clock() + duration + 1))
-
-	// Have it run for office. Two nodes are allowed to vote; a majority.
-	cluster.triggerElection(1, groupID)
-	election = cluster.waitForElection(1)
-
-	// Campaign on the third node. If we didn't drop incoming vote responses
-	// when a lease has been granted, the Raft self-vote plus the first node's
-	// vote would allows this to succeed. But that should not happen.
-	// Also, if we did not drop outgoing vote requests, this would harm the
-	// leadership obtained above.
-	cluster.triggerElection(2, groupID)
-	// Send a dummy append since there's no event for when an election fails.
-	cmdID = makeCommandID()
-	cluster.nodes[1].SubmitCommand(groupID, cmdID, []byte("test"))
-
-	// Wait for the command to commit on the first node.
-	commit := <-cluster.events[0].CommandCommitted
-	if commit.CommandID != cmdID {
-		t.Errorf("unexpected committed command: %v", commit)
-	}
-	// Check that the first node has the correct leader.
-	if l := cluster.nodes[0].groups[groupID].leader - 1; l != 1 {
-		t.Errorf("first node has unexpected leader: %d", l)
 	}
 }
 
@@ -407,7 +315,8 @@ func TestMembershipChange(t *testing.T) {
 	// Create a group with a single member, cluster.nodes[0].
 	groupID := uint64(1)
 	cluster.createGroup(groupID, 0, 1)
-	cluster.triggerElection(0, groupID)
+	// An automatic election is triggered since this is a single-node Raft group.
+	//cluster.triggerElection(0, groupID)
 	cluster.waitForElection(0)
 
 	// Consume and apply the membership change events.

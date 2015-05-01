@@ -24,6 +24,8 @@
 #include <google/protobuf/repeated_field.h>
 #include <google/protobuf/extension_set.h>
 #include <google/protobuf/unknown_field_set.h>
+#include "cockroach/proto/data.pb.h"
+#include "cockroach/proto/config.pb.h"
 #include "gogoproto/gogo.pb.h"
 // @@protoc_insertion_point(includes)
 
@@ -36,6 +38,7 @@ void protobuf_AssignDesc_cockroach_2fproto_2fstatus_2eproto();
 void protobuf_ShutdownFile_cockroach_2fproto_2fstatus_2eproto();
 
 class StoreStatus;
+class NodeStatus;
 
 // ===================================================================
 
@@ -92,12 +95,14 @@ class StoreStatus : public ::google::protobuf::Message {
 
   // accessors -------------------------------------------------------
 
-  // optional int32 store_id = 1;
-  inline bool has_store_id() const;
-  inline void clear_store_id();
-  static const int kStoreIdFieldNumber = 1;
-  inline ::google::protobuf::int32 store_id() const;
-  inline void set_store_id(::google::protobuf::int32 value);
+  // optional .cockroach.proto.StoreDescriptor desc = 1;
+  inline bool has_desc() const;
+  inline void clear_desc();
+  static const int kDescFieldNumber = 1;
+  inline const ::cockroach::proto::StoreDescriptor& desc() const;
+  inline ::cockroach::proto::StoreDescriptor* mutable_desc();
+  inline ::cockroach::proto::StoreDescriptor* release_desc();
+  inline void set_allocated_desc(::cockroach::proto::StoreDescriptor* desc);
 
   // optional int32 node_id = 2;
   inline bool has_node_id() const;
@@ -106,78 +111,203 @@ class StoreStatus : public ::google::protobuf::Message {
   inline ::google::protobuf::int32 node_id() const;
   inline void set_node_id(::google::protobuf::int32 value);
 
-  // repeated int64 raft_ids = 3;
-  inline int raft_ids_size() const;
-  inline void clear_raft_ids();
-  static const int kRaftIdsFieldNumber = 3;
-  inline ::google::protobuf::int64 raft_ids(int index) const;
-  inline void set_raft_ids(int index, ::google::protobuf::int64 value);
-  inline void add_raft_ids(::google::protobuf::int64 value);
-  inline const ::google::protobuf::RepeatedField< ::google::protobuf::int64 >&
-      raft_ids() const;
-  inline ::google::protobuf::RepeatedField< ::google::protobuf::int64 >*
-      mutable_raft_ids();
+  // optional int32 range_count = 3;
+  inline bool has_range_count() const;
+  inline void clear_range_count();
+  static const int kRangeCountFieldNumber = 3;
+  inline ::google::protobuf::int32 range_count() const;
+  inline void set_range_count(::google::protobuf::int32 value);
 
-  // optional int64 updated_at = 4;
-  inline bool has_updated_at() const;
-  inline void clear_updated_at();
-  static const int kUpdatedAtFieldNumber = 4;
-  inline ::google::protobuf::int64 updated_at() const;
-  inline void set_updated_at(::google::protobuf::int64 value);
-
-  // optional int64 started_at = 5;
+  // optional int64 started_at = 4;
   inline bool has_started_at() const;
   inline void clear_started_at();
-  static const int kStartedAtFieldNumber = 5;
+  static const int kStartedAtFieldNumber = 4;
   inline ::google::protobuf::int64 started_at() const;
   inline void set_started_at(::google::protobuf::int64 value);
 
-  // optional int64 used_bytes = 6;
-  inline bool has_used_bytes() const;
-  inline void clear_used_bytes();
-  static const int kUsedBytesFieldNumber = 6;
-  inline ::google::protobuf::int64 used_bytes() const;
-  inline void set_used_bytes(::google::protobuf::int64 value);
+  // optional int64 updated_at = 5;
+  inline bool has_updated_at() const;
+  inline void clear_updated_at();
+  static const int kUpdatedAtFieldNumber = 5;
+  inline ::google::protobuf::int64 updated_at() const;
+  inline void set_updated_at(::google::protobuf::int64 value);
 
-  // optional int64 max_bytes = 7;
-  inline bool has_max_bytes() const;
-  inline void clear_max_bytes();
-  static const int kMaxBytesFieldNumber = 7;
-  inline ::google::protobuf::int64 max_bytes() const;
-  inline void set_max_bytes(::google::protobuf::int64 value);
+  // optional .cockroach.proto.MVCCStats stats = 6;
+  inline bool has_stats() const;
+  inline void clear_stats();
+  static const int kStatsFieldNumber = 6;
+  inline const ::cockroach::proto::MVCCStats& stats() const;
+  inline ::cockroach::proto::MVCCStats* mutable_stats();
+  inline ::cockroach::proto::MVCCStats* release_stats();
+  inline void set_allocated_stats(::cockroach::proto::MVCCStats* stats);
 
   // @@protoc_insertion_point(class_scope:cockroach.proto.StoreStatus)
  private:
-  inline void set_has_store_id();
-  inline void clear_has_store_id();
+  inline void set_has_desc();
+  inline void clear_has_desc();
   inline void set_has_node_id();
   inline void clear_has_node_id();
-  inline void set_has_updated_at();
-  inline void clear_has_updated_at();
+  inline void set_has_range_count();
+  inline void clear_has_range_count();
   inline void set_has_started_at();
   inline void clear_has_started_at();
-  inline void set_has_used_bytes();
-  inline void clear_has_used_bytes();
-  inline void set_has_max_bytes();
-  inline void clear_has_max_bytes();
+  inline void set_has_updated_at();
+  inline void clear_has_updated_at();
+  inline void set_has_stats();
+  inline void clear_has_stats();
 
   ::google::protobuf::UnknownFieldSet _unknown_fields_;
 
   ::google::protobuf::uint32 _has_bits_[1];
   mutable int _cached_size_;
-  ::google::protobuf::int32 store_id_;
+  ::cockroach::proto::StoreDescriptor* desc_;
   ::google::protobuf::int32 node_id_;
-  ::google::protobuf::RepeatedField< ::google::protobuf::int64 > raft_ids_;
-  ::google::protobuf::int64 updated_at_;
+  ::google::protobuf::int32 range_count_;
   ::google::protobuf::int64 started_at_;
-  ::google::protobuf::int64 used_bytes_;
-  ::google::protobuf::int64 max_bytes_;
+  ::google::protobuf::int64 updated_at_;
+  ::cockroach::proto::MVCCStats* stats_;
   friend void  protobuf_AddDesc_cockroach_2fproto_2fstatus_2eproto();
   friend void protobuf_AssignDesc_cockroach_2fproto_2fstatus_2eproto();
   friend void protobuf_ShutdownFile_cockroach_2fproto_2fstatus_2eproto();
 
   void InitAsDefaultInstance();
   static StoreStatus* default_instance_;
+};
+// -------------------------------------------------------------------
+
+class NodeStatus : public ::google::protobuf::Message {
+ public:
+  NodeStatus();
+  virtual ~NodeStatus();
+
+  NodeStatus(const NodeStatus& from);
+
+  inline NodeStatus& operator=(const NodeStatus& from) {
+    CopyFrom(from);
+    return *this;
+  }
+
+  inline const ::google::protobuf::UnknownFieldSet& unknown_fields() const {
+    return _unknown_fields_;
+  }
+
+  inline ::google::protobuf::UnknownFieldSet* mutable_unknown_fields() {
+    return &_unknown_fields_;
+  }
+
+  static const ::google::protobuf::Descriptor* descriptor();
+  static const NodeStatus& default_instance();
+
+  void Swap(NodeStatus* other);
+
+  // implements Message ----------------------------------------------
+
+  NodeStatus* New() const;
+  void CopyFrom(const ::google::protobuf::Message& from);
+  void MergeFrom(const ::google::protobuf::Message& from);
+  void CopyFrom(const NodeStatus& from);
+  void MergeFrom(const NodeStatus& from);
+  void Clear();
+  bool IsInitialized() const;
+
+  int ByteSize() const;
+  bool MergePartialFromCodedStream(
+      ::google::protobuf::io::CodedInputStream* input);
+  void SerializeWithCachedSizes(
+      ::google::protobuf::io::CodedOutputStream* output) const;
+  ::google::protobuf::uint8* SerializeWithCachedSizesToArray(::google::protobuf::uint8* output) const;
+  int GetCachedSize() const { return _cached_size_; }
+  private:
+  void SharedCtor();
+  void SharedDtor();
+  void SetCachedSize(int size) const;
+  public:
+  ::google::protobuf::Metadata GetMetadata() const;
+
+  // nested types ----------------------------------------------------
+
+  // accessors -------------------------------------------------------
+
+  // optional .cockroach.proto.NodeDescriptor desc = 1;
+  inline bool has_desc() const;
+  inline void clear_desc();
+  static const int kDescFieldNumber = 1;
+  inline const ::cockroach::proto::NodeDescriptor& desc() const;
+  inline ::cockroach::proto::NodeDescriptor* mutable_desc();
+  inline ::cockroach::proto::NodeDescriptor* release_desc();
+  inline void set_allocated_desc(::cockroach::proto::NodeDescriptor* desc);
+
+  // repeated int32 store_ids = 2;
+  inline int store_ids_size() const;
+  inline void clear_store_ids();
+  static const int kStoreIdsFieldNumber = 2;
+  inline ::google::protobuf::int32 store_ids(int index) const;
+  inline void set_store_ids(int index, ::google::protobuf::int32 value);
+  inline void add_store_ids(::google::protobuf::int32 value);
+  inline const ::google::protobuf::RepeatedField< ::google::protobuf::int32 >&
+      store_ids() const;
+  inline ::google::protobuf::RepeatedField< ::google::protobuf::int32 >*
+      mutable_store_ids();
+
+  // optional int32 range_count = 3;
+  inline bool has_range_count() const;
+  inline void clear_range_count();
+  static const int kRangeCountFieldNumber = 3;
+  inline ::google::protobuf::int32 range_count() const;
+  inline void set_range_count(::google::protobuf::int32 value);
+
+  // optional int64 started_at = 4;
+  inline bool has_started_at() const;
+  inline void clear_started_at();
+  static const int kStartedAtFieldNumber = 4;
+  inline ::google::protobuf::int64 started_at() const;
+  inline void set_started_at(::google::protobuf::int64 value);
+
+  // optional int64 updated_at = 5;
+  inline bool has_updated_at() const;
+  inline void clear_updated_at();
+  static const int kUpdatedAtFieldNumber = 5;
+  inline ::google::protobuf::int64 updated_at() const;
+  inline void set_updated_at(::google::protobuf::int64 value);
+
+  // optional .cockroach.proto.MVCCStats stats = 6;
+  inline bool has_stats() const;
+  inline void clear_stats();
+  static const int kStatsFieldNumber = 6;
+  inline const ::cockroach::proto::MVCCStats& stats() const;
+  inline ::cockroach::proto::MVCCStats* mutable_stats();
+  inline ::cockroach::proto::MVCCStats* release_stats();
+  inline void set_allocated_stats(::cockroach::proto::MVCCStats* stats);
+
+  // @@protoc_insertion_point(class_scope:cockroach.proto.NodeStatus)
+ private:
+  inline void set_has_desc();
+  inline void clear_has_desc();
+  inline void set_has_range_count();
+  inline void clear_has_range_count();
+  inline void set_has_started_at();
+  inline void clear_has_started_at();
+  inline void set_has_updated_at();
+  inline void clear_has_updated_at();
+  inline void set_has_stats();
+  inline void clear_has_stats();
+
+  ::google::protobuf::UnknownFieldSet _unknown_fields_;
+
+  ::google::protobuf::uint32 _has_bits_[1];
+  mutable int _cached_size_;
+  ::cockroach::proto::NodeDescriptor* desc_;
+  ::google::protobuf::RepeatedField< ::google::protobuf::int32 > store_ids_;
+  ::google::protobuf::int64 started_at_;
+  ::google::protobuf::int64 updated_at_;
+  ::cockroach::proto::MVCCStats* stats_;
+  ::google::protobuf::int32 range_count_;
+  friend void  protobuf_AddDesc_cockroach_2fproto_2fstatus_2eproto();
+  friend void protobuf_AssignDesc_cockroach_2fproto_2fstatus_2eproto();
+  friend void protobuf_ShutdownFile_cockroach_2fproto_2fstatus_2eproto();
+
+  void InitAsDefaultInstance();
+  static NodeStatus* default_instance_;
 };
 // ===================================================================
 
@@ -186,28 +316,45 @@ class StoreStatus : public ::google::protobuf::Message {
 
 // StoreStatus
 
-// optional int32 store_id = 1;
-inline bool StoreStatus::has_store_id() const {
+// optional .cockroach.proto.StoreDescriptor desc = 1;
+inline bool StoreStatus::has_desc() const {
   return (_has_bits_[0] & 0x00000001u) != 0;
 }
-inline void StoreStatus::set_has_store_id() {
+inline void StoreStatus::set_has_desc() {
   _has_bits_[0] |= 0x00000001u;
 }
-inline void StoreStatus::clear_has_store_id() {
+inline void StoreStatus::clear_has_desc() {
   _has_bits_[0] &= ~0x00000001u;
 }
-inline void StoreStatus::clear_store_id() {
-  store_id_ = 0;
-  clear_has_store_id();
+inline void StoreStatus::clear_desc() {
+  if (desc_ != NULL) desc_->::cockroach::proto::StoreDescriptor::Clear();
+  clear_has_desc();
 }
-inline ::google::protobuf::int32 StoreStatus::store_id() const {
-  // @@protoc_insertion_point(field_get:cockroach.proto.StoreStatus.store_id)
-  return store_id_;
+inline const ::cockroach::proto::StoreDescriptor& StoreStatus::desc() const {
+  // @@protoc_insertion_point(field_get:cockroach.proto.StoreStatus.desc)
+  return desc_ != NULL ? *desc_ : *default_instance_->desc_;
 }
-inline void StoreStatus::set_store_id(::google::protobuf::int32 value) {
-  set_has_store_id();
-  store_id_ = value;
-  // @@protoc_insertion_point(field_set:cockroach.proto.StoreStatus.store_id)
+inline ::cockroach::proto::StoreDescriptor* StoreStatus::mutable_desc() {
+  set_has_desc();
+  if (desc_ == NULL) desc_ = new ::cockroach::proto::StoreDescriptor;
+  // @@protoc_insertion_point(field_mutable:cockroach.proto.StoreStatus.desc)
+  return desc_;
+}
+inline ::cockroach::proto::StoreDescriptor* StoreStatus::release_desc() {
+  clear_has_desc();
+  ::cockroach::proto::StoreDescriptor* temp = desc_;
+  desc_ = NULL;
+  return temp;
+}
+inline void StoreStatus::set_allocated_desc(::cockroach::proto::StoreDescriptor* desc) {
+  delete desc_;
+  desc_ = desc;
+  if (desc) {
+    set_has_desc();
+  } else {
+    clear_has_desc();
+  }
+  // @@protoc_insertion_point(field_set_allocated:cockroach.proto.StoreStatus.desc)
 }
 
 // optional int32 node_id = 2;
@@ -234,69 +381,39 @@ inline void StoreStatus::set_node_id(::google::protobuf::int32 value) {
   // @@protoc_insertion_point(field_set:cockroach.proto.StoreStatus.node_id)
 }
 
-// repeated int64 raft_ids = 3;
-inline int StoreStatus::raft_ids_size() const {
-  return raft_ids_.size();
+// optional int32 range_count = 3;
+inline bool StoreStatus::has_range_count() const {
+  return (_has_bits_[0] & 0x00000004u) != 0;
 }
-inline void StoreStatus::clear_raft_ids() {
-  raft_ids_.Clear();
+inline void StoreStatus::set_has_range_count() {
+  _has_bits_[0] |= 0x00000004u;
 }
-inline ::google::protobuf::int64 StoreStatus::raft_ids(int index) const {
-  // @@protoc_insertion_point(field_get:cockroach.proto.StoreStatus.raft_ids)
-  return raft_ids_.Get(index);
+inline void StoreStatus::clear_has_range_count() {
+  _has_bits_[0] &= ~0x00000004u;
 }
-inline void StoreStatus::set_raft_ids(int index, ::google::protobuf::int64 value) {
-  raft_ids_.Set(index, value);
-  // @@protoc_insertion_point(field_set:cockroach.proto.StoreStatus.raft_ids)
+inline void StoreStatus::clear_range_count() {
+  range_count_ = 0;
+  clear_has_range_count();
 }
-inline void StoreStatus::add_raft_ids(::google::protobuf::int64 value) {
-  raft_ids_.Add(value);
-  // @@protoc_insertion_point(field_add:cockroach.proto.StoreStatus.raft_ids)
+inline ::google::protobuf::int32 StoreStatus::range_count() const {
+  // @@protoc_insertion_point(field_get:cockroach.proto.StoreStatus.range_count)
+  return range_count_;
 }
-inline const ::google::protobuf::RepeatedField< ::google::protobuf::int64 >&
-StoreStatus::raft_ids() const {
-  // @@protoc_insertion_point(field_list:cockroach.proto.StoreStatus.raft_ids)
-  return raft_ids_;
-}
-inline ::google::protobuf::RepeatedField< ::google::protobuf::int64 >*
-StoreStatus::mutable_raft_ids() {
-  // @@protoc_insertion_point(field_mutable_list:cockroach.proto.StoreStatus.raft_ids)
-  return &raft_ids_;
+inline void StoreStatus::set_range_count(::google::protobuf::int32 value) {
+  set_has_range_count();
+  range_count_ = value;
+  // @@protoc_insertion_point(field_set:cockroach.proto.StoreStatus.range_count)
 }
 
-// optional int64 updated_at = 4;
-inline bool StoreStatus::has_updated_at() const {
+// optional int64 started_at = 4;
+inline bool StoreStatus::has_started_at() const {
   return (_has_bits_[0] & 0x00000008u) != 0;
 }
-inline void StoreStatus::set_has_updated_at() {
+inline void StoreStatus::set_has_started_at() {
   _has_bits_[0] |= 0x00000008u;
 }
-inline void StoreStatus::clear_has_updated_at() {
-  _has_bits_[0] &= ~0x00000008u;
-}
-inline void StoreStatus::clear_updated_at() {
-  updated_at_ = GOOGLE_LONGLONG(0);
-  clear_has_updated_at();
-}
-inline ::google::protobuf::int64 StoreStatus::updated_at() const {
-  // @@protoc_insertion_point(field_get:cockroach.proto.StoreStatus.updated_at)
-  return updated_at_;
-}
-inline void StoreStatus::set_updated_at(::google::protobuf::int64 value) {
-  set_has_updated_at();
-  updated_at_ = value;
-  // @@protoc_insertion_point(field_set:cockroach.proto.StoreStatus.updated_at)
-}
-
-// optional int64 started_at = 5;
-inline bool StoreStatus::has_started_at() const {
-  return (_has_bits_[0] & 0x00000010u) != 0;
-}
-inline void StoreStatus::set_has_started_at() {
-  _has_bits_[0] |= 0x00000010u;
-}
 inline void StoreStatus::clear_has_started_at() {
-  _has_bits_[0] &= ~0x00000010u;
+  _has_bits_[0] &= ~0x00000008u;
 }
 inline void StoreStatus::clear_started_at() {
   started_at_ = GOOGLE_LONGLONG(0);
@@ -312,52 +429,257 @@ inline void StoreStatus::set_started_at(::google::protobuf::int64 value) {
   // @@protoc_insertion_point(field_set:cockroach.proto.StoreStatus.started_at)
 }
 
-// optional int64 used_bytes = 6;
-inline bool StoreStatus::has_used_bytes() const {
-  return (_has_bits_[0] & 0x00000020u) != 0;
+// optional int64 updated_at = 5;
+inline bool StoreStatus::has_updated_at() const {
+  return (_has_bits_[0] & 0x00000010u) != 0;
 }
-inline void StoreStatus::set_has_used_bytes() {
-  _has_bits_[0] |= 0x00000020u;
+inline void StoreStatus::set_has_updated_at() {
+  _has_bits_[0] |= 0x00000010u;
 }
-inline void StoreStatus::clear_has_used_bytes() {
-  _has_bits_[0] &= ~0x00000020u;
+inline void StoreStatus::clear_has_updated_at() {
+  _has_bits_[0] &= ~0x00000010u;
 }
-inline void StoreStatus::clear_used_bytes() {
-  used_bytes_ = GOOGLE_LONGLONG(0);
-  clear_has_used_bytes();
+inline void StoreStatus::clear_updated_at() {
+  updated_at_ = GOOGLE_LONGLONG(0);
+  clear_has_updated_at();
 }
-inline ::google::protobuf::int64 StoreStatus::used_bytes() const {
-  // @@protoc_insertion_point(field_get:cockroach.proto.StoreStatus.used_bytes)
-  return used_bytes_;
+inline ::google::protobuf::int64 StoreStatus::updated_at() const {
+  // @@protoc_insertion_point(field_get:cockroach.proto.StoreStatus.updated_at)
+  return updated_at_;
 }
-inline void StoreStatus::set_used_bytes(::google::protobuf::int64 value) {
-  set_has_used_bytes();
-  used_bytes_ = value;
-  // @@protoc_insertion_point(field_set:cockroach.proto.StoreStatus.used_bytes)
+inline void StoreStatus::set_updated_at(::google::protobuf::int64 value) {
+  set_has_updated_at();
+  updated_at_ = value;
+  // @@protoc_insertion_point(field_set:cockroach.proto.StoreStatus.updated_at)
 }
 
-// optional int64 max_bytes = 7;
-inline bool StoreStatus::has_max_bytes() const {
-  return (_has_bits_[0] & 0x00000040u) != 0;
+// optional .cockroach.proto.MVCCStats stats = 6;
+inline bool StoreStatus::has_stats() const {
+  return (_has_bits_[0] & 0x00000020u) != 0;
 }
-inline void StoreStatus::set_has_max_bytes() {
-  _has_bits_[0] |= 0x00000040u;
+inline void StoreStatus::set_has_stats() {
+  _has_bits_[0] |= 0x00000020u;
 }
-inline void StoreStatus::clear_has_max_bytes() {
-  _has_bits_[0] &= ~0x00000040u;
+inline void StoreStatus::clear_has_stats() {
+  _has_bits_[0] &= ~0x00000020u;
 }
-inline void StoreStatus::clear_max_bytes() {
-  max_bytes_ = GOOGLE_LONGLONG(0);
-  clear_has_max_bytes();
+inline void StoreStatus::clear_stats() {
+  if (stats_ != NULL) stats_->::cockroach::proto::MVCCStats::Clear();
+  clear_has_stats();
 }
-inline ::google::protobuf::int64 StoreStatus::max_bytes() const {
-  // @@protoc_insertion_point(field_get:cockroach.proto.StoreStatus.max_bytes)
-  return max_bytes_;
+inline const ::cockroach::proto::MVCCStats& StoreStatus::stats() const {
+  // @@protoc_insertion_point(field_get:cockroach.proto.StoreStatus.stats)
+  return stats_ != NULL ? *stats_ : *default_instance_->stats_;
 }
-inline void StoreStatus::set_max_bytes(::google::protobuf::int64 value) {
-  set_has_max_bytes();
-  max_bytes_ = value;
-  // @@protoc_insertion_point(field_set:cockroach.proto.StoreStatus.max_bytes)
+inline ::cockroach::proto::MVCCStats* StoreStatus::mutable_stats() {
+  set_has_stats();
+  if (stats_ == NULL) stats_ = new ::cockroach::proto::MVCCStats;
+  // @@protoc_insertion_point(field_mutable:cockroach.proto.StoreStatus.stats)
+  return stats_;
+}
+inline ::cockroach::proto::MVCCStats* StoreStatus::release_stats() {
+  clear_has_stats();
+  ::cockroach::proto::MVCCStats* temp = stats_;
+  stats_ = NULL;
+  return temp;
+}
+inline void StoreStatus::set_allocated_stats(::cockroach::proto::MVCCStats* stats) {
+  delete stats_;
+  stats_ = stats;
+  if (stats) {
+    set_has_stats();
+  } else {
+    clear_has_stats();
+  }
+  // @@protoc_insertion_point(field_set_allocated:cockroach.proto.StoreStatus.stats)
+}
+
+// -------------------------------------------------------------------
+
+// NodeStatus
+
+// optional .cockroach.proto.NodeDescriptor desc = 1;
+inline bool NodeStatus::has_desc() const {
+  return (_has_bits_[0] & 0x00000001u) != 0;
+}
+inline void NodeStatus::set_has_desc() {
+  _has_bits_[0] |= 0x00000001u;
+}
+inline void NodeStatus::clear_has_desc() {
+  _has_bits_[0] &= ~0x00000001u;
+}
+inline void NodeStatus::clear_desc() {
+  if (desc_ != NULL) desc_->::cockroach::proto::NodeDescriptor::Clear();
+  clear_has_desc();
+}
+inline const ::cockroach::proto::NodeDescriptor& NodeStatus::desc() const {
+  // @@protoc_insertion_point(field_get:cockroach.proto.NodeStatus.desc)
+  return desc_ != NULL ? *desc_ : *default_instance_->desc_;
+}
+inline ::cockroach::proto::NodeDescriptor* NodeStatus::mutable_desc() {
+  set_has_desc();
+  if (desc_ == NULL) desc_ = new ::cockroach::proto::NodeDescriptor;
+  // @@protoc_insertion_point(field_mutable:cockroach.proto.NodeStatus.desc)
+  return desc_;
+}
+inline ::cockroach::proto::NodeDescriptor* NodeStatus::release_desc() {
+  clear_has_desc();
+  ::cockroach::proto::NodeDescriptor* temp = desc_;
+  desc_ = NULL;
+  return temp;
+}
+inline void NodeStatus::set_allocated_desc(::cockroach::proto::NodeDescriptor* desc) {
+  delete desc_;
+  desc_ = desc;
+  if (desc) {
+    set_has_desc();
+  } else {
+    clear_has_desc();
+  }
+  // @@protoc_insertion_point(field_set_allocated:cockroach.proto.NodeStatus.desc)
+}
+
+// repeated int32 store_ids = 2;
+inline int NodeStatus::store_ids_size() const {
+  return store_ids_.size();
+}
+inline void NodeStatus::clear_store_ids() {
+  store_ids_.Clear();
+}
+inline ::google::protobuf::int32 NodeStatus::store_ids(int index) const {
+  // @@protoc_insertion_point(field_get:cockroach.proto.NodeStatus.store_ids)
+  return store_ids_.Get(index);
+}
+inline void NodeStatus::set_store_ids(int index, ::google::protobuf::int32 value) {
+  store_ids_.Set(index, value);
+  // @@protoc_insertion_point(field_set:cockroach.proto.NodeStatus.store_ids)
+}
+inline void NodeStatus::add_store_ids(::google::protobuf::int32 value) {
+  store_ids_.Add(value);
+  // @@protoc_insertion_point(field_add:cockroach.proto.NodeStatus.store_ids)
+}
+inline const ::google::protobuf::RepeatedField< ::google::protobuf::int32 >&
+NodeStatus::store_ids() const {
+  // @@protoc_insertion_point(field_list:cockroach.proto.NodeStatus.store_ids)
+  return store_ids_;
+}
+inline ::google::protobuf::RepeatedField< ::google::protobuf::int32 >*
+NodeStatus::mutable_store_ids() {
+  // @@protoc_insertion_point(field_mutable_list:cockroach.proto.NodeStatus.store_ids)
+  return &store_ids_;
+}
+
+// optional int32 range_count = 3;
+inline bool NodeStatus::has_range_count() const {
+  return (_has_bits_[0] & 0x00000004u) != 0;
+}
+inline void NodeStatus::set_has_range_count() {
+  _has_bits_[0] |= 0x00000004u;
+}
+inline void NodeStatus::clear_has_range_count() {
+  _has_bits_[0] &= ~0x00000004u;
+}
+inline void NodeStatus::clear_range_count() {
+  range_count_ = 0;
+  clear_has_range_count();
+}
+inline ::google::protobuf::int32 NodeStatus::range_count() const {
+  // @@protoc_insertion_point(field_get:cockroach.proto.NodeStatus.range_count)
+  return range_count_;
+}
+inline void NodeStatus::set_range_count(::google::protobuf::int32 value) {
+  set_has_range_count();
+  range_count_ = value;
+  // @@protoc_insertion_point(field_set:cockroach.proto.NodeStatus.range_count)
+}
+
+// optional int64 started_at = 4;
+inline bool NodeStatus::has_started_at() const {
+  return (_has_bits_[0] & 0x00000008u) != 0;
+}
+inline void NodeStatus::set_has_started_at() {
+  _has_bits_[0] |= 0x00000008u;
+}
+inline void NodeStatus::clear_has_started_at() {
+  _has_bits_[0] &= ~0x00000008u;
+}
+inline void NodeStatus::clear_started_at() {
+  started_at_ = GOOGLE_LONGLONG(0);
+  clear_has_started_at();
+}
+inline ::google::protobuf::int64 NodeStatus::started_at() const {
+  // @@protoc_insertion_point(field_get:cockroach.proto.NodeStatus.started_at)
+  return started_at_;
+}
+inline void NodeStatus::set_started_at(::google::protobuf::int64 value) {
+  set_has_started_at();
+  started_at_ = value;
+  // @@protoc_insertion_point(field_set:cockroach.proto.NodeStatus.started_at)
+}
+
+// optional int64 updated_at = 5;
+inline bool NodeStatus::has_updated_at() const {
+  return (_has_bits_[0] & 0x00000010u) != 0;
+}
+inline void NodeStatus::set_has_updated_at() {
+  _has_bits_[0] |= 0x00000010u;
+}
+inline void NodeStatus::clear_has_updated_at() {
+  _has_bits_[0] &= ~0x00000010u;
+}
+inline void NodeStatus::clear_updated_at() {
+  updated_at_ = GOOGLE_LONGLONG(0);
+  clear_has_updated_at();
+}
+inline ::google::protobuf::int64 NodeStatus::updated_at() const {
+  // @@protoc_insertion_point(field_get:cockroach.proto.NodeStatus.updated_at)
+  return updated_at_;
+}
+inline void NodeStatus::set_updated_at(::google::protobuf::int64 value) {
+  set_has_updated_at();
+  updated_at_ = value;
+  // @@protoc_insertion_point(field_set:cockroach.proto.NodeStatus.updated_at)
+}
+
+// optional .cockroach.proto.MVCCStats stats = 6;
+inline bool NodeStatus::has_stats() const {
+  return (_has_bits_[0] & 0x00000020u) != 0;
+}
+inline void NodeStatus::set_has_stats() {
+  _has_bits_[0] |= 0x00000020u;
+}
+inline void NodeStatus::clear_has_stats() {
+  _has_bits_[0] &= ~0x00000020u;
+}
+inline void NodeStatus::clear_stats() {
+  if (stats_ != NULL) stats_->::cockroach::proto::MVCCStats::Clear();
+  clear_has_stats();
+}
+inline const ::cockroach::proto::MVCCStats& NodeStatus::stats() const {
+  // @@protoc_insertion_point(field_get:cockroach.proto.NodeStatus.stats)
+  return stats_ != NULL ? *stats_ : *default_instance_->stats_;
+}
+inline ::cockroach::proto::MVCCStats* NodeStatus::mutable_stats() {
+  set_has_stats();
+  if (stats_ == NULL) stats_ = new ::cockroach::proto::MVCCStats;
+  // @@protoc_insertion_point(field_mutable:cockroach.proto.NodeStatus.stats)
+  return stats_;
+}
+inline ::cockroach::proto::MVCCStats* NodeStatus::release_stats() {
+  clear_has_stats();
+  ::cockroach::proto::MVCCStats* temp = stats_;
+  stats_ = NULL;
+  return temp;
+}
+inline void NodeStatus::set_allocated_stats(::cockroach::proto::MVCCStats* stats) {
+  delete stats_;
+  stats_ = stats;
+  if (stats) {
+    set_has_stats();
+  } else {
+    clear_has_stats();
+  }
+  // @@protoc_insertion_point(field_set_allocated:cockroach.proto.NodeStatus.stats)
 }
 
 

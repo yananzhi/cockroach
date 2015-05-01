@@ -395,7 +395,7 @@ func (kv RawKeyValue) Compare(b llrb.Comparable) int {
 func NewTransaction(name string, baseKey Key, userPriority int32,
 	isolation IsolationType, now Timestamp, maxOffset int64) *Transaction {
 	// Compute priority by adjusting based on userPriority factor.
-	priority := MakePriority(userPriority)
+	priority := MakePriority(nil, userPriority)
 	// Compute timestamp and max timestamp.
 	max := now
 	max.WallTime += maxOffset
@@ -416,7 +416,7 @@ func NewTransaction(name string, baseKey Key, userPriority int32,
 // specified userPriority. If userPriority=100, the resulting
 // priority is 100x more likely to be probabilistically greater
 // than a similar invocation with userPriority=1.
-func MakePriority(userPriority int32) int32 {
+func MakePriority(r *rand.Rand, userPriority int32) int32 {
 	// A currently undocumented feature allows an explicit priority to
 	// be set by specifying priority < 1. The explicit priority is
 	// simply -userPriority in this case. This is hacky, but currently
@@ -437,6 +437,9 @@ func MakePriority(userPriority int32) int32 {
 	//   100           |  top 99/100ths of positive int32s
 	//   1000          |  top 999/1000ths of positive int32s
 	//   ...etc
+	if r != nil {
+		return math.MaxInt32 - r.Int31n(math.MaxInt32/userPriority)
+	}
 	return math.MaxInt32 - rand.Int31n(math.MaxInt32/userPriority)
 }
 
@@ -463,7 +466,7 @@ func (t *Transaction) Restart(userPriority, upgradePriority int32, timestamp Tim
 	t.OrigTimestamp = t.Timestamp
 	// Potentially upgrade priority both by creating a new random
 	// priority using userPriority and considering upgradePriority.
-	t.UpgradePriority(MakePriority(userPriority))
+	t.UpgradePriority(MakePriority(nil, userPriority))
 	t.UpgradePriority(upgradePriority)
 }
 
@@ -641,4 +644,47 @@ func (ts TimeSeriesData) ToInternal(keyDuration int64, sampleDuration int64) (
 	}
 
 	return result, nil
+}
+
+// Delta returns the difference between two MVCCStats structures.
+func (ms *MVCCStats) Delta(oms *MVCCStats) MVCCStats {
+	result := *ms
+	result.Subtract(oms)
+	return result
+}
+
+// Accumulate adds values from oms to ms.
+func (ms *MVCCStats) Accumulate(oms *MVCCStats) {
+	ms.LiveBytes += oms.LiveBytes
+	ms.KeyBytes += oms.KeyBytes
+	ms.ValBytes += oms.ValBytes
+	ms.IntentBytes += oms.IntentBytes
+	ms.LiveCount += oms.LiveCount
+	ms.KeyCount += oms.KeyCount
+	ms.ValCount += oms.ValCount
+	ms.IntentCount += oms.IntentCount
+	ms.IntentAge += oms.IntentAge
+	ms.GCBytesAge += oms.GCBytesAge
+	ms.LastUpdateNanos += oms.LastUpdateNanos
+}
+
+// Subtract subtracts the values of oms from ms.
+func (ms *MVCCStats) Subtract(oms *MVCCStats) {
+	ms.LiveBytes -= oms.LiveBytes
+	ms.KeyBytes -= oms.KeyBytes
+	ms.ValBytes -= oms.ValBytes
+	ms.IntentBytes -= oms.IntentBytes
+	ms.LiveCount -= oms.LiveCount
+	ms.KeyCount -= oms.KeyCount
+	ms.ValCount -= oms.ValCount
+	ms.IntentCount -= oms.IntentCount
+	ms.IntentAge -= oms.IntentAge
+	ms.GCBytesAge -= oms.GCBytesAge
+	ms.LastUpdateNanos -= oms.LastUpdateNanos
+}
+
+var _ fmt.Stringer = &Lease{}
+
+func (l Lease) String() string {
+	return fmt.Sprintf("%s-%s@%d", l.Start, l.Expiration, l.RaftNodeID)
 }

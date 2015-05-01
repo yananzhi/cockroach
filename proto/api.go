@@ -19,476 +19,52 @@ package proto
 
 import (
 	"log"
+	"math/rand"
 
 	"github.com/cockroachdb/cockroach/util"
 	gogoproto "github.com/gogo/protobuf/proto"
 )
 
-// TODO(spencer): change these string constants into a type.
-const (
-	// Contains determines whether the KV map contains the specified key.
-	Contains = "Contains"
-	// Get fetches the value for a key from the KV map, respecting a
-	// possibly historical timestamp. If the timestamp is 0, returns
-	// the most recent value.
-	Get = "Get"
-	// Put sets the value for a key at the specified timestamp. If the
-	// timestamp is 0, the value is set with the current time as timestamp.
-	Put = "Put"
-	// ConditionalPut sets the value for a key if the existing value
-	// matches the value specified in the request. Specifying a null value
-	// for existing means the value must not yet exist.
-	ConditionalPut = "ConditionalPut"
-	// Increment increments the value at the specified key. Once called
-	// for a key, Put & ConditionalPut will return errors; only
-	// Increment will continue to be a valid command. The value must be
-	// deleted before it can be reset using Put.
-	Increment = "Increment"
-	// Delete removes the value for the specified key.
-	Delete = "Delete"
-	// DeleteRange removes all values for keys which fall between
-	// args.RequestHeader.Key and args.RequestHeader.EndKey, with
-	// the latter endpoint excluded.
-	DeleteRange = "DeleteRange"
-	// Scan fetches the values for all keys which fall between
-	// args.RequestHeader.Key and args.RequestHeader.EndKey, with
-	// the latter endpoint excluded.
-	Scan = "Scan"
-	// EndTransaction either commits or aborts an ongoing transaction.
-	EndTransaction = "EndTransaction"
-	// ReapQueue scans and deletes messages from a recipient message
-	// queue. ReapQueueRequest invocations must be part of an extant
-	// transaction or they fail. Returns the reaped queue messsages, up to
-	// the requested maximum. If fewer than the maximum were returned,
-	// then the queue is empty.
-	ReapQueue = "ReapQueue"
-	// EnqueueUpdate enqueues an update for eventual execution.
-	EnqueueUpdate = "EnqueueUpdate"
-	// EnqueueMessage enqueues a message for delivery to an inbox.
-	EnqueueMessage = "EnqueueMessage"
-	// Batch executes a set of commands in parallel.
-	Batch = "Batch"
-	// AdminSplit is called to coordinate a split of a range.
-	AdminSplit = "AdminSplit"
-	// AdminMerge is called to coordinate a merge of two adjacent ranges.
-	AdminMerge = "AdminMerge"
-)
-
-type stringSet map[string]struct{}
-
-func (s stringSet) keys() []string {
-	keys := make([]string, 0, len(s))
-	for k := range s {
-		keys = append(keys, k)
-	}
-	return keys
-}
-
 // A RaftID is a unique ID associated to a Raft consensus group.
 type RaftID int64
-
-// TODO(spencer): replaces these individual maps with a bitmask or
-//   equivalent listing each method's attributes.
-
-// AllMethods specifies the complete set of methods.
-var AllMethods = stringSet{
-	Contains:              {},
-	Get:                   {},
-	Put:                   {},
-	ConditionalPut:        {},
-	Increment:             {},
-	Delete:                {},
-	DeleteRange:           {},
-	Scan:                  {},
-	EndTransaction:        {},
-	ReapQueue:             {},
-	EnqueueUpdate:         {},
-	EnqueueMessage:        {},
-	AdminSplit:            {},
-	AdminMerge:            {},
-	Batch:                 {},
-	InternalHeartbeatTxn:  {},
-	InternalGC:            {},
-	InternalPushTxn:       {},
-	InternalResolveIntent: {},
-	InternalMerge:         {},
-	InternalTruncateLog:   {},
-}
-
-// PublicMethods specifies the set of methods accessible via the
-// public key-value API.
-var PublicMethods = stringSet{
-	Contains:       {},
-	Get:            {},
-	Put:            {},
-	ConditionalPut: {},
-	Increment:      {},
-	Delete:         {},
-	DeleteRange:    {},
-	Scan:           {},
-	EndTransaction: {},
-	ReapQueue:      {},
-	EnqueueUpdate:  {},
-	EnqueueMessage: {},
-	Batch:          {},
-	AdminSplit:     {},
-	AdminMerge:     {},
-}
-
-// InternalMethods specifies the set of methods accessible only
-// via the internal node RPC API.
-var InternalMethods = stringSet{
-	InternalHeartbeatTxn:  {},
-	InternalGC:            {},
-	InternalPushTxn:       {},
-	InternalResolveIntent: {},
-	InternalMerge:         {},
-	InternalTruncateLog:   {},
-}
-
-// ReadMethods specifies the set of methods which read and return data.
-var ReadMethods = stringSet{
-	Contains:            {},
-	Get:                 {},
-	ConditionalPut:      {},
-	Increment:           {},
-	Scan:                {},
-	ReapQueue:           {},
-	InternalRangeLookup: {},
-}
-
-// WriteMethods specifies the set of methods which write data.
-var WriteMethods = stringSet{
-	Put:                   {},
-	ConditionalPut:        {},
-	Increment:             {},
-	Delete:                {},
-	DeleteRange:           {},
-	EndTransaction:        {},
-	ReapQueue:             {},
-	EnqueueUpdate:         {},
-	EnqueueMessage:        {},
-	Batch:                 {},
-	InternalHeartbeatTxn:  {},
-	InternalGC:            {},
-	InternalPushTxn:       {},
-	InternalResolveIntent: {},
-	InternalMerge:         {},
-	InternalTruncateLog:   {},
-}
-
-// TxnMethods specifies the set of methods which leave key intents
-// during transactions.
-var TxnMethods = stringSet{
-	Put:            {},
-	ConditionalPut: {},
-	Increment:      {},
-	Delete:         {},
-	DeleteRange:    {},
-	ReapQueue:      {},
-	EnqueueUpdate:  {},
-	EnqueueMessage: {},
-}
-
-// adminMethods specifies the set of methods which are neither
-// read-only nor read-write commands but instead execute directly on
-// the Raft leader.
-var adminMethods = stringSet{
-	AdminSplit: {},
-	AdminMerge: {},
-}
-
-// NeedReadPerm returns true if the specified method requires read permissions.
-func NeedReadPerm(method string) bool {
-	_, ok := ReadMethods[method]
-	return ok
-}
-
-// NeedWritePerm returns true if the specified method requires write permissions.
-func NeedWritePerm(method string) bool {
-	_, ok := WriteMethods[method]
-	return ok
-}
-
-// NeedAdminPerm returns true if the specified method requires admin permissions.
-func NeedAdminPerm(method string) bool {
-	_, ok := adminMethods[method]
-	return ok
-}
-
-// IsPublic returns true if the specified method is in the public
-// key-value API.
-func IsPublic(method string) bool {
-	_, ok := PublicMethods[method]
-	return ok
-}
-
-// IsInternal returns true if the specified method is only available
-// via the internal node RPC API.
-func IsInternal(method string) bool {
-	_, ok := InternalMethods[method]
-	return ok
-}
-
-// IsReadOnly returns true if the specified method only requires read
-// permissions.
-func IsReadOnly(method string) bool {
-	return NeedReadPerm(method) && !NeedWritePerm(method)
-}
-
-// IsReadWrite returns true if the specified method requires write
-// permissions.
-func IsReadWrite(method string) bool {
-	return NeedWritePerm(method)
-}
-
-// IsAdmin returns true if the specified method requires admin
-// permissions.
-func IsAdmin(method string) bool {
-	return NeedAdminPerm(method)
-}
-
-// IsTransactional returns true if the specified method can be part of
-// a transaction.
-func IsTransactional(method string) bool {
-	_, ok := TxnMethods[method]
-	return ok
-}
-
-// GetArgs returns a GetRequest object initialized to get the
-// value at key.
-func GetArgs(key Key) *GetRequest {
-	return &GetRequest{
-		RequestHeader: RequestHeader{
-			Key: key,
-		},
-	}
-}
-
-// IncrementArgs returns an IncrementRequest object initialized to
-// increment the value at key by increment.
-func IncrementArgs(key Key, increment int64) *IncrementRequest {
-	return &IncrementRequest{
-		RequestHeader: RequestHeader{
-			Key: key,
-		},
-		Increment: increment,
-	}
-}
-
-// PutArgs returns a PutRequest object initialized to put value
-// as a byte slice at key.
-func PutArgs(key Key, valueBytes []byte) *PutRequest {
-	value := Value{Bytes: valueBytes}
-	value.InitChecksum(key)
-	return &PutRequest{
-		RequestHeader: RequestHeader{
-			Key: key,
-		},
-		Value: value,
-	}
-}
-
-// DeleteArgs returns a DeleteRequest object initialized to delete
-// the value at key.
-func DeleteArgs(key Key) *DeleteRequest {
-	return &DeleteRequest{
-		RequestHeader: RequestHeader{
-			Key: key,
-		},
-	}
-}
-
-// DeleteRangeArgs returns a DeleteRangeRequest object initialized to delete
-// the values in the given key range (excluding the endpoint).
-func DeleteRangeArgs(startKey, endKey Key) *DeleteRangeRequest {
-	return &DeleteRangeRequest{
-		RequestHeader: RequestHeader{
-			Key:    startKey,
-			EndKey: endKey,
-		},
-	}
-}
-
-// ScanArgs returns a ScanRequest object initialized to scan
-// from start to end keys with max results.
-func ScanArgs(key, endKey Key, maxResults int64) *ScanRequest {
-	return &ScanRequest{
-		RequestHeader: RequestHeader{
-			Key:    key,
-			EndKey: endKey,
-		},
-		MaxResults: maxResults,
-	}
-}
-
-// MethodForRequest returns the method name corresponding to the type
-// of the request.
-func MethodForRequest(req Request) (string, error) {
-	switch req.(type) {
-	case *ContainsRequest:
-		return Contains, nil
-	case *GetRequest:
-		return Get, nil
-	case *PutRequest:
-		return Put, nil
-	case *ConditionalPutRequest:
-		return ConditionalPut, nil
-	case *IncrementRequest:
-		return Increment, nil
-	case *DeleteRequest:
-		return Delete, nil
-	case *DeleteRangeRequest:
-		return DeleteRange, nil
-	case *ScanRequest:
-		return Scan, nil
-	case *EndTransactionRequest:
-		return EndTransaction, nil
-	case *ReapQueueRequest:
-		return ReapQueue, nil
-	case *EnqueueUpdateRequest:
-		return EnqueueUpdate, nil
-	case *EnqueueMessageRequest:
-		return EnqueueMessage, nil
-	case *BatchRequest:
-		return Batch, nil
-	case *AdminSplitRequest:
-		return AdminSplit, nil
-	case *AdminMergeRequest:
-		return AdminMerge, nil
-	case *InternalHeartbeatTxnRequest:
-		return InternalHeartbeatTxn, nil
-	case *InternalGCRequest:
-		return InternalGC, nil
-	case *InternalPushTxnRequest:
-		return InternalPushTxn, nil
-	case *InternalResolveIntentRequest:
-		return InternalResolveIntent, nil
-	case *InternalMergeRequest:
-		return InternalMerge, nil
-	case *InternalTruncateLogRequest:
-		return InternalTruncateLog, nil
-	case *InternalLeaderLeaseRequest:
-		return InternalLeaderLease, nil
-	}
-	return "", util.Errorf("unhandled request %T", req)
-}
-
-// CreateArgsAndReply returns allocated request and response pairs
-// according to the specified method.
-func CreateArgsAndReply(method string) (args Request, reply Response, err error) {
-	if args, err = CreateArgs(method); err != nil {
-		return
-	}
-	reply, err = CreateReply(method)
-	return
-}
-
-// CreateArgs returns an allocated request according to the specified method.
-func CreateArgs(method string) (Request, error) {
-	switch method {
-	case Contains:
-		return &ContainsRequest{}, nil
-	case Get:
-		return &GetRequest{}, nil
-	case Put:
-		return &PutRequest{}, nil
-	case ConditionalPut:
-		return &ConditionalPutRequest{}, nil
-	case Increment:
-		return &IncrementRequest{}, nil
-	case Delete:
-		return &DeleteRequest{}, nil
-	case DeleteRange:
-		return &DeleteRangeRequest{}, nil
-	case Scan:
-		return &ScanRequest{}, nil
-	case EndTransaction:
-		return &EndTransactionRequest{}, nil
-	case ReapQueue:
-		return &ReapQueueRequest{}, nil
-	case EnqueueUpdate:
-		return &EnqueueUpdateRequest{}, nil
-	case EnqueueMessage:
-		return &EnqueueMessageRequest{}, nil
-	case Batch:
-		return &BatchRequest{}, nil
-	case AdminSplit:
-		return &AdminSplitRequest{}, nil
-	case AdminMerge:
-		return &AdminMergeRequest{}, nil
-	case InternalHeartbeatTxn:
-		return &InternalHeartbeatTxnRequest{}, nil
-	case InternalGC:
-		return &InternalGCRequest{}, nil
-	case InternalPushTxn:
-		return &InternalPushTxnRequest{}, nil
-	case InternalResolveIntent:
-		return &InternalResolveIntentRequest{}, nil
-	case InternalMerge:
-		return &InternalMergeRequest{}, nil
-	case InternalTruncateLog:
-		return &InternalTruncateLogRequest{}, nil
-	case InternalLeaderLease:
-		return &InternalLeaderLeaseRequest{}, nil
-	}
-	return nil, util.Errorf("unhandled method %s", method)
-}
-
-// CreateReply returns an allocated response according to the specified method.
-func CreateReply(method string) (Response, error) {
-	switch method {
-	case Contains:
-		return &ContainsResponse{}, nil
-	case Get:
-		return &GetResponse{}, nil
-	case Put:
-		return &PutResponse{}, nil
-	case ConditionalPut:
-		return &ConditionalPutResponse{}, nil
-	case Increment:
-		return &IncrementResponse{}, nil
-	case Delete:
-		return &DeleteResponse{}, nil
-	case DeleteRange:
-		return &DeleteRangeResponse{}, nil
-	case Scan:
-		return &ScanResponse{}, nil
-	case EndTransaction:
-		return &EndTransactionResponse{}, nil
-	case ReapQueue:
-		return &ReapQueueResponse{}, nil
-	case EnqueueUpdate:
-		return &EnqueueUpdateResponse{}, nil
-	case EnqueueMessage:
-		return &EnqueueMessageResponse{}, nil
-	case Batch:
-		return &BatchResponse{}, nil
-	case AdminSplit:
-		return &AdminSplitResponse{}, nil
-	case AdminMerge:
-		return &AdminMergeResponse{}, nil
-	case InternalHeartbeatTxn:
-		return &InternalHeartbeatTxnResponse{}, nil
-	case InternalGC:
-		return &InternalGCResponse{}, nil
-	case InternalPushTxn:
-		return &InternalPushTxnResponse{}, nil
-	case InternalResolveIntent:
-		return &InternalResolveIntentResponse{}, nil
-	case InternalMerge:
-		return &InternalMergeResponse{}, nil
-	case InternalTruncateLog:
-		return &InternalTruncateLogResponse{}, nil
-	case InternalLeaderLease:
-		return &InternalLeaderLeaseResponse{}, nil
-	}
-	return nil, util.Errorf("unhandled method %s", method)
-}
 
 // IsEmpty returns true if the client command ID has zero values.
 func (ccid ClientCmdID) IsEmpty() bool {
 	return ccid.WallTime == 0 && ccid.Random == 0
+}
+
+const (
+	isAdmin = 1 << iota
+	isRead
+	isWrite
+	isTxnWrite
+)
+
+// IsAdmin returns true if the request requires admin permissions.
+func IsAdmin(args Request) bool {
+	return (args.flags() & isAdmin) != 0
+}
+
+// IsRead returns true if the request requires read permissions.
+func IsRead(args Request) bool {
+	return (args.flags() & isRead) != 0
+}
+
+// IsWrite returns true if the request requires write permissions.
+func IsWrite(args Request) bool {
+	return (args.flags() & isWrite) != 0
+}
+
+// IsReadOnly returns true if the request only requires read
+// permissions.
+func IsReadOnly(args Request) bool {
+	return IsRead(args) && !IsWrite(args)
+}
+
+// IsTransactionWrite returns true if the request produces write
+// intents when used within a transaction.
+func IsTransactionWrite(args Request) bool {
+	return (args.flags() & isTxnWrite) != 0
 }
 
 // Request is an interface for RPC requests.
@@ -496,6 +72,11 @@ type Request interface {
 	gogoproto.Message
 	// Header returns the request header.
 	Header() *RequestHeader
+	// Method returns the request method.
+	Method() Method
+	// CreateReply creates a new response object.
+	CreateReply() Response
+	flags() int
 }
 
 // Response is an interface for RPC responses.
@@ -515,6 +96,21 @@ type Response interface {
 // should be done by the caller instead.
 type Combinable interface {
 	Combine(Response)
+}
+
+// GetOrCreateCmdID returns the request header's command ID if available.
+// Otherwise, creates a new ClientCmdID, initialized with current time
+// and random salt.
+func (rh *RequestHeader) GetOrCreateCmdID(walltime int64) (cmdID ClientCmdID) {
+	if !rh.CmdID.IsEmpty() {
+		cmdID = rh.CmdID
+	} else {
+		cmdID = ClientCmdID{
+			WallTime: walltime,
+			Random:   rand.Int63(),
+		}
+	}
+	return
 }
 
 // Combine is used by range-spanning Response types (e.g. Scan or DeleteRange)
@@ -656,7 +252,10 @@ func (sr *ScanResponse) Verify(req Request) error {
 //   representing the constituent requests.
 func (br *BatchRequest) Add(args Request) {
 	union := RequestUnion{}
-	union.SetValue(args)
+	if !union.SetValue(args) {
+		// TODO(tschottdorf) evaluate whether this should return an error.
+		log.Fatalf("unable to add %T to batch request", args)
+	}
 	if br.Key == nil {
 		br.Key = args.Header().Key
 		br.EndKey = args.Header().EndKey
@@ -667,7 +266,10 @@ func (br *BatchRequest) Add(args Request) {
 // Add adds a response to the batch response.
 func (br *BatchResponse) Add(reply Response) {
 	union := ResponseUnion{}
-	union.SetValue(reply)
+	if !union.SetValue(reply) {
+		// TODO(tschottdorf) evaluate whether this should return an error.
+		log.Fatalf("unable to add %T to batch response", reply)
+	}
 	br.Responses = append(br.Responses, union)
 }
 
@@ -698,3 +300,151 @@ type Countable interface {
 func (sr *ScanResponse) Count() int64 {
 	return int64(len(sr.Rows))
 }
+
+// Method implements the Request interface.
+func (*ContainsRequest) Method() Method { return Contains }
+
+// Method implements the Request interface.
+func (*GetRequest) Method() Method { return Get }
+
+// Method implements the Request interface.
+func (*PutRequest) Method() Method { return Put }
+
+// Method implements the Request interface.
+func (*ConditionalPutRequest) Method() Method { return ConditionalPut }
+
+// Method implements the Request interface.
+func (*IncrementRequest) Method() Method { return Increment }
+
+// Method implements the Request interface.
+func (*DeleteRequest) Method() Method { return Delete }
+
+// Method implements the Request interface.
+func (*DeleteRangeRequest) Method() Method { return DeleteRange }
+
+// Method implements the Request interface.
+func (*ScanRequest) Method() Method { return Scan }
+
+// Method implements the Request interface.
+func (*EndTransactionRequest) Method() Method { return EndTransaction }
+
+// Method implements the Request interface.
+func (*BatchRequest) Method() Method { return Batch }
+
+// Method implements the Request interface.
+func (*AdminSplitRequest) Method() Method { return AdminSplit }
+
+// Method implements the Request interface.
+func (*AdminMergeRequest) Method() Method { return AdminMerge }
+
+// Method implements the Request interface.
+func (*InternalHeartbeatTxnRequest) Method() Method { return InternalHeartbeatTxn }
+
+// Method implements the Request interface.
+func (*InternalGCRequest) Method() Method { return InternalGC }
+
+// Method implements the Request interface.
+func (*InternalPushTxnRequest) Method() Method { return InternalPushTxn }
+
+// Method implements the Request interface.
+func (*InternalRangeLookupRequest) Method() Method { return InternalRangeLookup }
+
+// Method implements the Request interface.
+func (*InternalResolveIntentRequest) Method() Method { return InternalResolveIntent }
+
+// Method implements the Request interface.
+func (*InternalMergeRequest) Method() Method { return InternalMerge }
+
+// Method implements the Request interface.
+func (*InternalLeaderLeaseRequest) Method() Method { return InternalLeaderLease }
+
+// Method implements the Request interface.
+func (*InternalTruncateLogRequest) Method() Method { return InternalTruncateLog }
+
+// Method implements the Request interface.
+func (*InternalBatchRequest) Method() Method { return InternalBatch }
+
+// CreateReply implements the Request interface.
+func (*ContainsRequest) CreateReply() Response { return &ContainsResponse{} }
+
+// CreateReply implements the Request interface.
+func (*GetRequest) CreateReply() Response { return &GetResponse{} }
+
+// CreateReply implements the Request interface.
+func (*PutRequest) CreateReply() Response { return &PutResponse{} }
+
+// CreateReply implements the Request interface.
+func (*ConditionalPutRequest) CreateReply() Response { return &ConditionalPutResponse{} }
+
+// CreateReply implements the Request interface.
+func (*IncrementRequest) CreateReply() Response { return &IncrementResponse{} }
+
+// CreateReply implements the Request interface.
+func (*DeleteRequest) CreateReply() Response { return &DeleteResponse{} }
+
+// CreateReply implements the Request interface.
+func (*DeleteRangeRequest) CreateReply() Response { return &DeleteRangeResponse{} }
+
+// CreateReply implements the Request interface.
+func (*ScanRequest) CreateReply() Response { return &ScanResponse{} }
+
+// CreateReply implements the Request interface.
+func (*EndTransactionRequest) CreateReply() Response { return &EndTransactionResponse{} }
+
+// CreateReply implements the Request interface.
+func (*BatchRequest) CreateReply() Response { return &BatchResponse{} }
+
+// CreateReply implements the Request interface.
+func (*AdminSplitRequest) CreateReply() Response { return &AdminSplitResponse{} }
+
+// CreateReply implements the Request interface.
+func (*AdminMergeRequest) CreateReply() Response { return &AdminMergeResponse{} }
+
+// CreateReply implements the Request interface.
+func (*InternalHeartbeatTxnRequest) CreateReply() Response { return &InternalHeartbeatTxnResponse{} }
+
+// CreateReply implements the Request interface.
+func (*InternalGCRequest) CreateReply() Response { return &InternalGCResponse{} }
+
+// CreateReply implements the Request interface.
+func (*InternalPushTxnRequest) CreateReply() Response { return &InternalPushTxnResponse{} }
+
+// CreateReply implements the Request interface.
+func (*InternalRangeLookupRequest) CreateReply() Response { return &InternalRangeLookupResponse{} }
+
+// CreateReply implements the Request interface.
+func (*InternalResolveIntentRequest) CreateReply() Response { return &InternalResolveIntentResponse{} }
+
+// CreateReply implements the Request interface.
+func (*InternalMergeRequest) CreateReply() Response { return &InternalMergeResponse{} }
+
+// CreateReply implements the Request interface.
+func (*InternalTruncateLogRequest) CreateReply() Response { return &InternalTruncateLogResponse{} }
+
+// CreateReply implements the Request interface.
+func (*InternalLeaderLeaseRequest) CreateReply() Response { return &InternalLeaderLeaseResponse{} }
+
+// CreateReply implements the Request interface.
+func (*InternalBatchRequest) CreateReply() Response { return &InternalBatchResponse{} }
+
+func (*ContainsRequest) flags() int              { return isRead }
+func (*GetRequest) flags() int                   { return isRead }
+func (*PutRequest) flags() int                   { return isWrite | isTxnWrite }
+func (*ConditionalPutRequest) flags() int        { return isRead | isWrite | isTxnWrite }
+func (*IncrementRequest) flags() int             { return isRead | isWrite | isTxnWrite }
+func (*DeleteRequest) flags() int                { return isWrite | isTxnWrite }
+func (*DeleteRangeRequest) flags() int           { return isWrite | isTxnWrite }
+func (*ScanRequest) flags() int                  { return isRead }
+func (*EndTransactionRequest) flags() int        { return isWrite }
+func (*BatchRequest) flags() int                 { return isWrite }
+func (*AdminSplitRequest) flags() int            { return isAdmin }
+func (*AdminMergeRequest) flags() int            { return isAdmin }
+func (*InternalHeartbeatTxnRequest) flags() int  { return isWrite }
+func (*InternalGCRequest) flags() int            { return isWrite }
+func (*InternalPushTxnRequest) flags() int       { return isWrite }
+func (*InternalRangeLookupRequest) flags() int   { return isRead }
+func (*InternalResolveIntentRequest) flags() int { return isWrite }
+func (*InternalMergeRequest) flags() int         { return isWrite }
+func (*InternalTruncateLogRequest) flags() int   { return isWrite }
+func (*InternalLeaderLeaseRequest) flags() int   { return isWrite }
+func (*InternalBatchRequest) flags() int         { return isWrite }

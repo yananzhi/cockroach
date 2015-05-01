@@ -18,7 +18,11 @@
 
 package proto
 
-import "math"
+import (
+	"fmt"
+	"math"
+	"time"
+)
 
 // InfiniteOffset is the offset value used if we fail to detect a heartbeat.
 var InfiniteOffset = RemoteOffset{
@@ -29,4 +33,10 @@ var InfiniteOffset = RemoteOffset{
 // Equal is a equality comparison between remote offsets.
 func (r RemoteOffset) Equal(o RemoteOffset) bool {
 	return r.Offset == o.Offset && r.Error == o.Error && r.MeasuredAt == o.MeasuredAt
+}
+
+// String formats the RemoteOffset for human readability.
+func (r RemoteOffset) String() string {
+	t := time.Unix(r.MeasuredAt/1E9, 0).UTC()
+	return fmt.Sprintf("off=%.9fs, err=%.9fs, at=%s", float64(r.Offset)/1E9, float64(r.Error)/1E9, t)
 }

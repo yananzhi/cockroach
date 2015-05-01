@@ -21,39 +21,10 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/cockroachdb/cockroach/client"
-	"github.com/cockroachdb/cockroach/gossip"
 	"github.com/cockroachdb/cockroach/kv"
-	"github.com/cockroachdb/cockroach/multiraft"
 	"github.com/cockroachdb/cockroach/proto"
-	"github.com/cockroachdb/cockroach/rpc"
-	"github.com/cockroachdb/cockroach/storage"
 	"github.com/cockroachdb/cockroach/storage/engine"
-	"github.com/cockroachdb/cockroach/util"
-	"github.com/cockroachdb/cockroach/util/hlc"
 	gogoproto "github.com/gogo/protobuf/proto"
-)
-
-// TODO: These values were copied from storage/range_test.go in the
-// name of expediency. A better home should be found for common test defaults
-// like this.
-var (
-	testDefaultAcctConfig = proto.AcctConfig{}
-	testDefaultPermConfig = proto.PermConfig{
-		Read:  []string{"root"},
-		Write: []string{"root"},
-	}
-	testDefaultZoneConfig = proto.ZoneConfig{
-		ReplicaAttrs: []proto.Attributes{
-			{Attrs: []string{"dc1", "mem"}},
-			{Attrs: []string{"dc2", "mem"}},
-		},
-		RangeMinBytes: 1 << 10, // 1k
-		RangeMaxBytes: 1 << 18, // 256k
-		GC: &proto.GCPolicy{
-			TTLSeconds: 24 * 60 * 60, // 1 day
-		},
-	}
 )
 
 // testModel is a model-based testing structure used to verify that time
@@ -73,76 +44,25 @@ var (
 type testModel struct {
 	t         testing.TB
 	modelData map[string]*proto.Value
-	db        *DB
-
-	engine      engine.Engine
-	store       *storage.Store
-	transport   multiraft.Transport
-	manualClock *hlc.ManualClock
-	clock       *hlc.Clock
-	stopper     *util.Stopper
+	*kv.LocalTestCluster
+	DB *DB
 }
 
 // newTestModel creates a new testModel instance. The Start() method must
 // be called before using it.
 func newTestModel(t *testing.T) *testModel {
 	return &testModel{
-		t:         t,
-		modelData: make(map[string]*proto.Value),
+		t:                t,
+		modelData:        make(map[string]*proto.Value),
+		LocalTestCluster: &kv.LocalTestCluster{},
 	}
 }
 
-// Start constructs and starts the ts.DB instance and the cockroach store
-// backing it.
+// Start constructs and starts the local test server and creates a
+// time series DB.
 func (tm *testModel) Start() {
-	// Initialize some supporting objects needed to initialize the store.
-	rpcContext := rpc.NewContext(hlc.NewClock(hlc.UnixNano), rpc.LoadInsecureTLSConfig())
-	gossip := gossip.New(rpcContext, gossip.TestInterval, gossip.TestBootstrap)
-	tm.manualClock = hlc.NewManualClock(0)
-	tm.clock = hlc.NewClock(tm.manualClock.UnixNano)
-	tm.transport = multiraft.NewLocalRPCTransport()
-	tm.stopper = util.NewStopper()
-	tm.stopper.AddCloser(tm.transport)
-
-	// Initialize a new in-memory engine.
-	tm.engine = engine.NewInMem(proto.Attributes{Attrs: []string{"dc1", "mem"}}, 1<<20)
-
-	// Initialize and bootstrap a store which uses the engine.
-	sender := kv.NewLocalSender()
-	tm.store = storage.NewStore(tm.clock, tm.engine, client.NewKV(nil, sender), gossip, tm.transport, storage.TestStoreConfig)
-	if err := tm.store.Bootstrap(proto.StoreIdent{NodeID: 1, StoreID: 1}, tm.stopper); err != nil {
-		tm.t.Fatal(err)
-	}
-	if err := tm.store.BootstrapRange(); err != nil {
-		tm.t.Fatal(err)
-	}
-	sender.AddStore(tm.store)
-	if err := tm.store.Start(tm.stopper); err != nil {
-		tm.t.Fatal(err)
-	}
-
-	tm.initConfigs()
-
-	// Initialize the DB instance.
-	tm.db = NewDB(client.NewKV(nil, sender))
-}
-
-// Stop stops the system under test.
-func (tm *testModel) Stop() {
-	tm.stopper.Stop()
-}
-
-// initConfigs adds some default configuration entries to the data store.
-func (tm *testModel) initConfigs() {
-	if err := engine.MVCCPutProto(tm.engine, nil, engine.KeyConfigAccountingPrefix, proto.MinTimestamp, nil, &testDefaultAcctConfig); err != nil {
-		tm.t.Fatal(err)
-	}
-	if err := engine.MVCCPutProto(tm.engine, nil, engine.KeyConfigPermissionPrefix, proto.MinTimestamp, nil, &testDefaultPermConfig); err != nil {
-		tm.t.Fatal(err)
-	}
-	if err := engine.MVCCPutProto(tm.engine, nil, engine.KeyConfigZonePrefix, proto.MinTimestamp, nil, &testDefaultZoneConfig); err != nil {
-		tm.t.Fatal(err)
-	}
+	tm.LocalTestCluster.Start(tm.t)
+	tm.DB = NewDB(tm.KV)
 }
 
 // getActualData returns the actual value of all time series keys in the
@@ -151,7 +71,7 @@ func (tm *testModel) getActualData() map[string]*proto.Value {
 	// Scan over all TS Keys stored in the engine
 	startKey := keyDataPrefix
 	endKey := keyDataPrefix.PrefixEnd()
-	keyValues, err := engine.MVCCScan(tm.engine, startKey, endKey, 0, tm.clock.Now(), true, nil)
+	keyValues, err := engine.MVCCScan(tm.Eng, startKey, endKey, 0, tm.Clock.Now(), true, nil)
 	if err != nil {
 		tm.t.Fatalf("error scanning TS data from engine: %s", err.Error())
 	}
@@ -223,7 +143,7 @@ func (tm *testModel) assertKeyCount(expected int) {
 // in both the model and the system under test.
 func (tm *testModel) storeTimeSeriesData(r Resolution, data proto.TimeSeriesData) {
 	// Store data in the system under test.
-	if err := tm.db.storeData(r, data); err != nil {
+	if err := tm.DB.storeData(r, data); err != nil {
 		tm.t.Fatalf("error storing time series data: %s", err.Error())
 	}
 

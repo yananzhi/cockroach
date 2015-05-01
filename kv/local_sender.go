@@ -78,12 +78,19 @@ func (ls *LocalSender) AddStore(s *storage.Store) {
 	ls.storeMap[s.Ident.StoreID] = s
 }
 
+// RemoveStore removes the specified store from the store map.
+func (ls *LocalSender) RemoveStore(s *storage.Store) {
+	ls.mu.Lock()
+	defer ls.mu.Unlock()
+	delete(ls.storeMap, s.Ident.StoreID)
+}
+
 // VisitStores implements a visitor pattern over stores in the storeMap.
 // The specified function is invoked with each store in turn. Stores are
 // visited in a random order.
 func (ls *LocalSender) VisitStores(visitor func(s *storage.Store) error) error {
-	ls.mu.Lock()
-	defer ls.mu.Unlock()
+	ls.mu.RLock()
+	defer ls.mu.RUnlock()
 	for _, s := range ls.storeMap {
 		if err := visitor(s); err != nil {
 			return err
@@ -92,11 +99,22 @@ func (ls *LocalSender) VisitStores(visitor func(s *storage.Store) error) error {
 	return nil
 }
 
+// GetStoreIDs returns all the current store ids in a random order.
+func (ls *LocalSender) GetStoreIDs() []proto.StoreID {
+	ls.mu.RLock()
+	defer ls.mu.RUnlock()
+	storeIDs := make([]proto.StoreID, 0, len(ls.storeMap))
+	for storeID := range ls.storeMap {
+		storeIDs = append(storeIDs, storeID)
+	}
+	return storeIDs
+}
+
 // Send implements the client.KVSender interface. The store is looked
 // up from the store map if specified by header.Replica; otherwise,
 // the command is being executed locally, and the replica is
 // determined via lookup through each store's LookupRange method.
-func (ls *LocalSender) Send(call *client.Call) {
+func (ls *LocalSender) Send(call client.Call) {
 	var err error
 	var store *storage.Store
 
@@ -127,7 +145,7 @@ func (ls *LocalSender) Send(call *client.Call) {
 			// MaxTimestamp = Timestamp corresponds to no clock uncertainty.
 			header.Txn.MaxTimestamp = header.Txn.Timestamp
 		}
-		store.ExecuteCmd(call.Method, call.Args, call.Reply)
+		store.ExecuteCmd(call.Args, call.Reply)
 	}
 }
 
@@ -135,13 +153,28 @@ func (ls *LocalSender) Send(call *client.Call) {
 // by consulting each store in turn via Store.LookupRange(key).
 // Returns RaftID and replica on success; RangeKeyMismatch error
 // if not found.
-func (ls *LocalSender) lookupReplica(start, end proto.Key) (int64, *proto.Replica, error) {
+// TODO(tschottdorf) with a very large number of stores, the LocalSender
+// may want to avoid scanning the whole map of stores on each invocation.
+func (ls *LocalSender) lookupReplica(start, end proto.Key) (raftID int64, replica *proto.Replica, err error) {
 	ls.mu.RLock()
 	defer ls.mu.RUnlock()
+	var rng *storage.Range
 	for _, store := range ls.storeMap {
-		if rng := store.LookupRange(start, end); rng != nil {
-			return rng.Desc().RaftID, rng.GetReplica(), nil
+		rng = store.LookupRange(start, end)
+		if rng == nil {
+			continue
 		}
+		if replica == nil {
+			raftID = rng.Desc().RaftID
+			replica = rng.GetReplica()
+			continue
+		}
+		// Should never happen outside of tests.
+		return 0, nil, util.Errorf(
+			"range %+v exists on additional store: %+v", rng, store)
 	}
-	return 0, nil, proto.NewRangeKeyMismatchError(start, end, nil)
+	if replica == nil {
+		err = proto.NewRangeKeyMismatchError(start, end, nil)
+	}
+	return raftID, replica, err
 }

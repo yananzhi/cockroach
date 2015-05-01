@@ -19,7 +19,6 @@ package kv
 
 import (
 	"bytes"
-	"fmt"
 	"net"
 	"time"
 
@@ -95,7 +94,7 @@ type DistSender struct {
 	// DistSender lives on. It should be accessed via getNodeDescriptor(),
 	// which tries to obtain the value from the Gossip network if the
 	// descriptor is unknown.
-	nodeDescriptor *storage.NodeDescriptor
+	nodeDescriptor *proto.NodeDescriptor
 	// clock is used to set time for some calls. E.g. read-only ops
 	// which span ranges and don't require read consistency.
 	clock *hlc.Clock
@@ -133,7 +132,7 @@ type DistSenderContext struct {
 	// nodeDescriptor, if provided, is used to describe which node the DistSender
 	// lives on, for instance when deciding where to send RPCs.
 	// Usually it is filled in from the Gossip network on demand.
-	nodeDescriptor *storage.NodeDescriptor
+	nodeDescriptor *proto.NodeDescriptor
 	// The RPC dispatcher. Defaults to rpc.Send but can be changed here
 	// for testing purposes.
 	rpcSend           rpcSendFn
@@ -192,15 +191,16 @@ func NewDistSender(ctx *DistSenderContext, gossip *gossip.Gossip) *DistSender {
 // for permission. For example, if a scan crosses two permission
 // configs, both configs must allow read permissions or the entire
 // scan will fail.
-func (ds *DistSender) verifyPermissions(method string, header *proto.RequestHeader) error {
+func (ds *DistSender) verifyPermissions(args proto.Request) error {
 	// The root user can always proceed.
+	header := args.Header()
 	if header.User == storage.UserRoot {
 		return nil
 	}
 	// Check for admin methods.
-	if proto.NeedAdminPerm(method) {
+	if proto.IsAdmin(args) {
 		if header.User != storage.UserRoot {
-			return util.Errorf("user %q cannot invoke admin command %s", header.User, method)
+			return util.Errorf("user %q cannot invoke admin command %s", header.User, args.Method())
 		}
 		return nil
 	}
@@ -210,11 +210,11 @@ func (ds *DistSender) verifyPermissions(method string, header *proto.RequestHead
 		return util.Errorf("permissions not available via gossip")
 	}
 	if configMap == nil {
-		return util.Errorf("perm configs not available; cannot execute %s", method)
+		return util.Errorf("perm configs not available; cannot execute %s", args.Method())
 	}
 	permMap := configMap.(storage.PrefixConfigMap)
 	headerEnd := header.EndKey
-	if headerEnd == nil {
+	if len(headerEnd) == 0 {
 		headerEnd = header.Key
 	}
 	// Visit PermConfig(s) which apply to the method's key range.
@@ -232,10 +232,10 @@ func (ds *DistSender) verifyPermissions(method string, header *proto.RequestHead
 			hasPerm := false
 			permMap.VisitPrefixesHierarchically(start, func(start, end proto.Key, config interface{}) (bool, error) {
 				perm := config.(*proto.PermConfig)
-				if proto.NeedReadPerm(method) && !perm.CanRead(header.User) {
+				if proto.IsRead(args) && !perm.CanRead(header.User) {
 					return false, nil
 				}
-				if proto.NeedWritePerm(method) && !perm.CanWrite(header.User) {
+				if proto.IsWrite(args) && !perm.CanWrite(header.User) {
 					return false, nil
 				}
 				// Return done = true, as permissions have been granted by this config.
@@ -243,7 +243,10 @@ func (ds *DistSender) verifyPermissions(method string, header *proto.RequestHead
 				return true, nil
 			})
 			if !hasPerm {
-				return false, util.Errorf("user %q cannot invoke %s at %q-%q", header.User, method, start, end)
+				if len(header.EndKey) == 0 {
+					return false, util.Errorf("user %q cannot invoke %s at %q", header.User, args.Method(), start)
+				}
+				return false, util.Errorf("user %q cannot invoke %s at %q-%q", header.User, args.Method(), start, end)
 			}
 			return false, nil
 		})
@@ -267,7 +270,7 @@ func (ds *DistSender) internalRangeLookup(key proto.Key, info *proto.RangeDescri
 		MaxRanges: ds.rangeLookupMaxRanges,
 	}
 	reply := &proto.InternalRangeLookupResponse{}
-	if err := ds.sendRPC(info, "InternalRangeLookup", args, reply); err != nil {
+	if err := ds.sendRPC(info, args, reply); err != nil {
 		return nil, err
 	}
 	if reply.Error != nil {
@@ -356,14 +359,14 @@ func (ds *DistSender) optimizeReplicaOrder(replicas proto.ReplicaSlice) rpc.Orde
 // We must jump through hoops here to get the node descriptor because it's not available
 // until after the node has joined the gossip network and been allowed to initialize
 // its stores.
-func (ds *DistSender) getNodeDescriptor() *storage.NodeDescriptor {
+func (ds *DistSender) getNodeDescriptor() *proto.NodeDescriptor {
 	if ds.nodeDescriptor != nil {
 		return ds.nodeDescriptor
 	}
 	ownNodeID := ds.gossip.GetNodeID()
 	if nodeDesc, err := ds.gossip.GetInfo(
 		gossip.MakeNodeIDKey(ownNodeID)); err == nil && ownNodeID > 0 {
-		ds.nodeDescriptor = nodeDesc.(*storage.NodeDescriptor)
+		ds.nodeDescriptor = nodeDesc.(*proto.NodeDescriptor)
 	} else {
 		log.Infof("unable to determine this node's attributes for replica " +
 			"selection; node is most likely bootstrapping")
@@ -378,15 +381,14 @@ func (ds *DistSender) getNodeDescriptor() *storage.NodeDescriptor {
 // server must succeed. Returns an RPC error if the request could not be sent.
 // Note that the reply may contain a higher level error and must be checked in
 // addition to the RPC error.
-func (ds *DistSender) sendRPC(desc *proto.RangeDescriptor, method string,
+func (ds *DistSender) sendRPC(desc *proto.RangeDescriptor,
 	args proto.Request, reply proto.Response) error {
 	if len(desc.Replicas) == 0 {
-		return util.Errorf("%s: replicas set is empty", method)
+		return util.Errorf("%s: replicas set is empty", args.Method())
 	}
 
 	// Copy and rearrange the replicas suitably, then return the desired order.
-	replicas := proto.ReplicaSlice(append(make([]proto.Replica,
-		len(desc.Replicas)), desc.Replicas...))
+	replicas := proto.ReplicaSlice(append([]proto.Replica(nil), desc.Replicas...))
 	// Rearrange the replicas so that those replicas with long common
 	// prefix of attributes end up first. If there's no prefix, this is a
 	// no-op.
@@ -394,8 +396,7 @@ func (ds *DistSender) sendRPC(desc *proto.RangeDescriptor, method string,
 
 	// If this request needs to go to a leader and we know who that is, move
 	// it to the front and send requests in order.
-	if args.Header().ReadConsistency != proto.INCONSISTENT ||
-		proto.IsReadWrite(method) {
+	if args.Header().ReadConsistency != proto.INCONSISTENT || proto.IsWrite(args) {
 		if leader := ds.leaderCache.Lookup(proto.RaftID(desc.RaftID)); leader != nil {
 			i, _ := replicas.FindReplica(leader.StoreID)
 			if i >= 0 {
@@ -409,9 +410,9 @@ func (ds *DistSender) sendRPC(desc *proto.RangeDescriptor, method string,
 	var addrs []net.Addr
 	replicaMap := map[string]*proto.Replica{}
 	for i := range replicas {
-		addr, err := storage.NodeIDToAddress(ds.gossip, replicas[i].NodeID)
+		addr, err := ds.gossip.GetNodeIDAddress(replicas[i].NodeID)
 		if err != nil {
-			log.V(1).Infof("node %d address is not gossiped", replicas[i].NodeID)
+			log.V(1).Infof("node %d address is not gossiped: %v", replicas[i].NodeID, err)
 			continue
 		}
 		addrs = append(addrs, addr)
@@ -456,37 +457,38 @@ func (ds *DistSender) sendRPC(desc *proto.RangeDescriptor, method string,
 		}
 		return gogoproto.Clone(reply)
 	}
-	_, err := ds.rpcSend(rpcOpts, "Node."+method, addrs, getArgs, getReply, ds.gossip.RPCContext)
+	_, err := ds.rpcSend(rpcOpts, "Node."+args.Method().String(),
+		addrs, getArgs, getReply, ds.gossip.RPCContext)
 	return err
 }
 
 // Send implements the client.KVSender interface. It verifies
 // permissions and looks up the appropriate range based on the
-// supplied key and sends the RPC according to the specified
-// options.
-// If the request spans multiple ranges (which is possible for
-// Scan or DeleteRange requests), Send sends requests to the
-// individual ranges sequentially and combines the results
-// transparently.
-func (ds *DistSender) Send(call *client.Call) {
+// supplied key and sends the RPC according to the specified options.
+//
+// If the request spans multiple ranges (which is possible for Scan or
+// DeleteRange requests), Send sends requests to the individual ranges
+// sequentially and combines the results transparently.
+//
+// This may temporarily adjust the request headers, so the client.Call
+// must not be used concurrently until Send has returned.
+func (ds *DistSender) Send(call client.Call) {
 
 	// TODO: Refactor this method into more manageable pieces.
 	// Verify permissions.
-	if err := ds.verifyPermissions(call.Method, call.Args.Header()); err != nil {
+	if err := ds.verifyPermissions(call.Args); err != nil {
 		call.Reply.Header().SetGoError(err)
 		return
 	}
 
 	// Retry logic for lookup of range by key and RPCs to range replicas.
 	retryOpts := ds.rpcRetryOptions
-	retryOpts.Tag = fmt.Sprintf("routing %s rpc", call.Method)
+	retryOpts.Tag = "routing " + call.Method().String() + " rpc"
 
-	// responses and descNext are only used when executing across ranges.
-	var responses []proto.Response
 	var descNext *proto.RangeDescriptor
-	// args will be changed to point to a copy of call.Args if the request
-	// spans ranges since in that case we need to alter its contents.
 	args := call.Args
+	reply := call.Reply
+	endKey := args.Header().EndKey
 
 	// In the event that timestamp isn't set and read consistency isn't
 	// required, set the timestamp using the local clock.
@@ -495,7 +497,6 @@ func (ds *DistSender) Send(call *client.Call) {
 	}
 
 	for {
-		reply := call.Reply
 		err := util.RetryWithBackoff(retryOpts, func() (util.RetryStatus, error) {
 			reply.Header().Reset()
 			descNext = nil
@@ -503,7 +504,7 @@ func (ds *DistSender) Send(call *client.Call) {
 			if err == nil {
 				// If the request accesses keys beyond the end of this range,
 				// get the descriptor of the adjacent range to address next.
-				if desc.EndKey.Less(call.Args.Header().EndKey) {
+				if desc.EndKey.Less(endKey) {
 					if _, ok := call.Reply.(proto.Combinable); !ok {
 						return util.RetryBreak, util.Error("illegal cross-range operation", call)
 					}
@@ -511,7 +512,7 @@ func (ds *DistSender) Send(call *client.Call) {
 					// re-run as part of a transaction for consistency. The
 					// case where we don't need to re-run is if the read
 					// consistency is not required.
-					if call.Args.Header().Txn == nil &&
+					if args.Header().Txn == nil &&
 						args.Header().ReadConsistency != proto.INCONSISTENT {
 						return util.RetryBreak, &proto.OpRequiresTxnError{}
 					}
@@ -519,31 +520,20 @@ func (ds *DistSender) Send(call *client.Call) {
 					// previous descriptor and range lookups use cache
 					// prefetching.
 					descNext, err = ds.rangeCache.LookupRangeDescriptor(desc.EndKey)
-					// If this is the first step in a multi-range operation,
-					// additionally copy call.Args because we will have to
-					// mutate it as we talk to the involved ranges.
-					if len(responses) == 0 {
-						args = gogoproto.Clone(call.Args).(proto.Request)
-					}
 					// Truncate the request to our current range.
 					args.Header().EndKey = desc.EndKey
 				}
 			}
-			// true if we're dealing with a range-spanning request.
-			isMulti := len(responses) > 0 || descNext != nil
+
 			if err == nil {
-				if isMulti {
-					// Make a new reply object for this call.
-					reply = gogoproto.Clone(call.Reply).(proto.Response)
-				}
-				err = ds.sendRPC(desc, call.Method, args, reply)
+				err = ds.sendRPC(desc, args, reply)
 				if err == nil && reply.Header().Error != nil {
 					err = reply.Header().GoError()
 				}
 			}
 
 			if err != nil {
-				log.Warningf("failed to invoke %s: %s", call.Method, err)
+				log.Warningf("failed to invoke %s: %s", call.Method(), err)
 				// If retryable, allow retry. For range not found or range
 				// key mismatch errors, we don't backoff on the retry,
 				// but reset the backoff loop so we can retry immediately.
@@ -554,65 +544,65 @@ func (ds *DistSender) Send(call *client.Call) {
 					// On addressing errors, don't backoff; retry immediately.
 					return util.RetryReset, nil
 				case *proto.NotLeaderError:
-					ds.updateLeaderCache(proto.RaftID(desc.RaftID),
-						err.(*proto.NotLeaderError).GetLeader())
+					leader := err.(*proto.NotLeaderError).GetLeader()
+					if leader != nil {
+						ds.updateLeaderCache(proto.RaftID(desc.RaftID), *leader)
+					}
 					return util.RetryReset, nil
 				default:
 					if retryErr, ok := err.(util.Retryable); ok && retryErr.CanRetry() {
 						return util.RetryContinue, nil
 					}
 				}
-			} else if isMulti {
-				// If this request spans ranges, collect the replies.
-				responses = append(responses, reply)
+				return util.RetryBreak, err
+			}
 
-				// If this request has a bound, such as MaxResults in ScanRequest,
-				// check whether enough rows are got in this round.
-				if args, ok := args.(proto.Bounded); ok && args.GetBound() > 0 {
-					bound := args.GetBound()
-					if reply, ok := reply.(proto.Countable); ok {
-						if nextBound := bound - reply.Count(); nextBound > 0 {
-							// Update bound for the next round.
-							args.SetBound(nextBound)
-						} else {
-							// Set flag to break the loop.
-							descNext = nil
-						}
+			// If this request has a bound, such as MaxResults in
+			// ScanRequest, check whether enough rows have been retrieved.
+			if args, ok := args.(proto.Bounded); ok && args.GetBound() > 0 {
+				bound := args.GetBound()
+				if reply, ok := reply.(proto.Countable); ok {
+					if nextBound := bound - reply.Count(); nextBound > 0 {
+						// Update bound for the next round.
+						args.SetBound(nextBound)
+					} else {
+						// Set flag to break the loop.
+						descNext = nil
 					}
 				}
+			}
 
-				// descNext can be nil in two cases:
-				// 1. Got enough rows in the middle of the request.
-				// 2. It is the last range of the request.
-				if descNext == nil {
-					// Combine multiple responses into the first one.
-					for _, r := range responses[1:] {
-						// We've already ascertained earlier that we're dealing with a
-						// Combinable response type.
-						responses[0].(proto.Combinable).Combine(r)
-					}
-
-					// Write the final response back.
-					gogoproto.Merge(call.Reply, responses[0])
-				}
+			if call.Reply != reply {
+				// This is a multi-range request. Combine the new response
+				// with the existing response.
+				call.Reply.(proto.Combinable).Combine(reply)
 			}
 			return util.RetryBreak, err
 		})
+
+		// "Untruncate" EndKey to original. We do this even on error in
+		// case the caller will retry using the same args.
+		args.Header().EndKey = endKey
+
 		// Immediately return if querying a range failed non-retryably.
 		// For multi-range requests, we return the failing range's reply.
 		if err != nil {
-			reply.Header().SetGoError(err)
-			gogoproto.Merge(call.Reply, reply) // Only relevant in multi-range case.
+			call.Reply.Header().SetGoError(err)
 			return
 		}
 		// If this was the last range accessed by this call, exit loop.
 		if descNext == nil {
 			break
 		}
+
 		// In next iteration, query next range.
 		args.Header().Key = descNext.StartKey
-		// "Untruncate" EndKey to original.
-		args.Header().EndKey = call.Args.Header().EndKey
+
+		if reply == call.Reply {
+			// This is a mult-range request, make a new reply object for
+			// subsequent iterations of the loop.
+			reply = args.CreateReply()
+		}
 	}
 }
 

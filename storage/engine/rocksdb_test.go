@@ -73,19 +73,13 @@ func encodeTransaction(timestamp proto.Timestamp, t *testing.T) []byte {
 func TestRocksDBCompaction(t *testing.T) {
 	defer leaktest.AfterTest(t)
 	gob.Register(proto.Timestamp{})
-	loc := util.CreateTempDirectory()
 	rocksdb := newMemRocksDB(proto.Attributes{Attrs: []string{"ssd"}}, testCacheSize)
 	err := rocksdb.Open()
 	if err != nil {
-		t.Fatalf("could not create new rocksdb db instance at %s: %v", loc, err)
+		t.Fatalf("could not create new in-memory rocksdb db instance: %v", err)
 	}
 	rocksdb.SetGCTimeouts(1, 2)
-	defer func(t *testing.T) {
-		rocksdb.Close()
-		if err := rocksdb.Destroy(); err != nil {
-			t.Errorf("could not delete rocksdb db at %s: %v", loc, err)
-		}
-	}(t)
+	defer rocksdb.Close()
 
 	cmdID := &proto.ClientCmdID{WallTime: 1, Random: 1}
 
@@ -193,6 +187,7 @@ func setupMVCCScanData(numVersions, numKeys int, b *testing.B) *RocksDB {
 		if err := batch.Commit(); err != nil {
 			b.Fatal(err)
 		}
+		batch.Close()
 	}
 	rocksdb.CompactRange(nil, nil)
 
@@ -417,6 +412,8 @@ func runMVCCBatchPut(valueSize, batchSize int, b *testing.B) {
 		if err := batch.Commit(); err != nil {
 			b.Fatal(err)
 		}
+
+		batch.Close()
 	}
 
 	b.StopTimer()
@@ -454,7 +451,7 @@ func runMVCCMerge(value *proto.Value, numKeys int, b *testing.B) {
 	// Use parallelism if specified when test is run.
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			ms := MVCCStats{}
+			ms := proto.MVCCStats{}
 			if err := MVCCMerge(rocksdb, &ms, keys[rand.Intn(numKeys)], *value); err != nil {
 				b.Fatal(err)
 			}

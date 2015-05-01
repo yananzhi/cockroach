@@ -22,6 +22,7 @@ import (
 	"io/ioutil"
 	"net"
 	"os"
+	"testing"
 	"time"
 
 	"github.com/cockroachdb/cockroach/util/log"
@@ -47,13 +48,41 @@ func tempLocalhostAddr() string {
 	return "127.0.0.1:0"
 }
 
-// CreateTempDirectory creates a temporary directory or fails trying.
-func CreateTempDirectory() string {
-	loc, err := ioutil.TempDir("", "rocksdb_test")
+// CreateTempDir creates a temporary directory and returns its path.
+// You should usually call defer CleanupDir(dir) right after.
+func CreateTempDir(t *testing.T, prefix string) string {
+	dir, err := ioutil.TempDir("", prefix)
 	if err != nil {
-		panic(fmt.Sprintf("%v", err))
+		t.Fatal(err)
 	}
-	return loc
+	return dir
+}
+
+// CreateNTempDirs creates N temporary directories and returns a slice
+// of paths.
+// You should usually call defer CleanupDirs(dirs) right after.
+func CreateNTempDirs(t *testing.T, prefix string, n int) []string {
+	dirs := make([]string, n)
+	var err error
+	for i := 0; i < n; i++ {
+		dirs[i], err = ioutil.TempDir("", prefix)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	return dirs
+}
+
+// CleanupDir removes the passed-in directory and all contents. Errors are ignored.
+func CleanupDir(dir string) {
+	os.RemoveAll(dir)
+}
+
+// CleanupDirs removes all passed-in directories and their contents.
+func CleanupDirs(dirs []string) {
+	for _, dir := range dirs {
+		os.RemoveAll(dir)
+	}
 }
 
 // CreateTestAddr creates an unused address for testing. The "network"
@@ -81,6 +110,9 @@ func CreateTestAddr(network string) net.Addr {
 // invoked immediately at first and then successively with an
 // exponential backoff starting at 1ns and ending at the specified
 // duration.
+//
+// This method is deprecated; use SucceedsWithin instead.
+// TODO(bdarnell): convert existing uses of IsTrueWithin to SucceedsWithin.
 func IsTrueWithin(trueFunc func() bool, duration time.Duration) error {
 	total := time.Duration(0)
 	for wait := time.Duration(1); total < duration; wait *= 2 {
@@ -91,4 +123,23 @@ func IsTrueWithin(trueFunc func() bool, duration time.Duration) error {
 		total += wait
 	}
 	return fmt.Errorf("condition failed to evaluate true within %s", duration)
+}
+
+// SucceedsWithin fails the test (with t.Fatal) unless the supplied
+// function runs without error within the specified duration. The
+// function is invoked immediately at first and then successively with
+// an exponential backoff starting at 1ns and ending at the specified
+// duration.
+func SucceedsWithin(t testing.TB, duration time.Duration, fn func() error) {
+	total := time.Duration(0)
+	var lastErr error
+	for wait := time.Duration(1); total < duration; wait *= 2 {
+		lastErr = fn()
+		if lastErr == nil {
+			return
+		}
+		time.Sleep(wait)
+		total += wait
+	}
+	t.Fatalf("condition failed to evaluate within %s: %s", duration, lastErr)
 }

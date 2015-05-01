@@ -20,6 +20,7 @@ package storage_test
 import (
 	"bytes"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/proto"
@@ -43,7 +44,7 @@ func adminMergeArgs(key []byte, raftID int64, storeID proto.StoreID) (*proto.Adm
 
 func createSplitRanges(store *storage.Store) (*proto.RangeDescriptor, *proto.RangeDescriptor, error) {
 	args, reply := adminSplitArgs(engine.KeyMin, []byte("b"), 1, store.StoreID())
-	if err := store.ExecuteCmd(proto.AdminSplit, args, reply); err != nil {
+	if err := store.ExecuteCmd(args, reply); err != nil {
 		return nil, nil, err
 	}
 
@@ -71,7 +72,7 @@ func TestStoreRangeMergeTwoEmptyRanges(t *testing.T) {
 
 	// Merge the b range back into the a range.
 	args, reply := adminMergeArgs(engine.KeyMin, 1, store.StoreID())
-	err = store.ExecuteCmd(proto.AdminMerge, args, reply)
+	err = store.ExecuteCmd(args, reply)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,29 +102,29 @@ func TestStoreRangeMergeWithData(t *testing.T) {
 
 	// Write some values left and right of the proposed split key.
 	pArgs, pReply := putArgs([]byte("aaa"), content, aDesc.RaftID, store.StoreID())
-	if err := store.ExecuteCmd(proto.Put, pArgs, pReply); err != nil {
+	if err := store.ExecuteCmd(pArgs, pReply); err != nil {
 		t.Fatal(err)
 	}
 	pArgs, pReply = putArgs([]byte("ccc"), content, bDesc.RaftID, store.StoreID())
-	if err := store.ExecuteCmd(proto.Put, pArgs, pReply); err != nil {
+	if err := store.ExecuteCmd(pArgs, pReply); err != nil {
 		t.Fatal(err)
 	}
 
 	// Confirm the values are there.
 	gArgs, gReply := getArgs([]byte("aaa"), aDesc.RaftID, store.StoreID())
-	if err := store.ExecuteCmd(proto.Get, gArgs, gReply); err != nil ||
+	if err := store.ExecuteCmd(gArgs, gReply); err != nil ||
 		!bytes.Equal(gReply.Value.Bytes, content) {
 		t.Fatal(err)
 	}
 	gArgs, gReply = getArgs([]byte("ccc"), bDesc.RaftID, store.StoreID())
-	if err := store.ExecuteCmd(proto.Get, gArgs, gReply); err != nil ||
+	if err := store.ExecuteCmd(gArgs, gReply); err != nil ||
 		!bytes.Equal(gReply.Value.Bytes, content) {
 		t.Fatal(err)
 	}
 
 	// Merge the b range back into the a range.
 	args, reply := adminMergeArgs(engine.KeyMin, 1, store.StoreID())
-	if err := store.ExecuteCmd(proto.AdminMerge, args, reply); err != nil {
+	if err := store.ExecuteCmd(args, reply); err != nil {
 		t.Fatal(err)
 	}
 
@@ -150,33 +151,33 @@ func TestStoreRangeMergeWithData(t *testing.T) {
 
 	// Try to get values from after the merge.
 	gArgs, gReply = getArgs([]byte("aaa"), rangeA.Desc().RaftID, store.StoreID())
-	if err := store.ExecuteCmd(proto.Get, gArgs, gReply); err != nil ||
+	if err := store.ExecuteCmd(gArgs, gReply); err != nil ||
 		!bytes.Equal(gReply.Value.Bytes, content) {
 		t.Fatal(err)
 	}
 	gArgs, gReply = getArgs([]byte("ccc"), rangeB.Desc().RaftID, store.StoreID())
-	if err := store.ExecuteCmd(proto.Get, gArgs, gReply); err != nil ||
+	if err := store.ExecuteCmd(gArgs, gReply); err != nil ||
 		!bytes.Equal(gReply.Value.Bytes, content) {
 		t.Fatal(err)
 	}
 
 	// Put new values after the merge on both sides.
 	pArgs, pReply = putArgs([]byte("aaaa"), content, rangeA.Desc().RaftID, store.StoreID())
-	if err = store.ExecuteCmd(proto.Put, pArgs, pReply); err != nil {
+	if err = store.ExecuteCmd(pArgs, pReply); err != nil {
 		t.Fatal(err)
 	}
 	pArgs, pReply = putArgs([]byte("cccc"), content, rangeB.Desc().RaftID, store.StoreID())
-	if err = store.ExecuteCmd(proto.Put, pArgs, pReply); err != nil {
+	if err = store.ExecuteCmd(pArgs, pReply); err != nil {
 		t.Fatal(err)
 	}
 
 	// Try to get the newly placed values.
 	gArgs, gReply = getArgs([]byte("aaaa"), rangeA.Desc().RaftID, store.StoreID())
-	if err := store.ExecuteCmd(proto.Get, gArgs, gReply); err != nil || !bytes.Equal(gReply.Value.Bytes, content) {
+	if err := store.ExecuteCmd(gArgs, gReply); err != nil || !bytes.Equal(gReply.Value.Bytes, content) {
 		t.Fatal(err)
 	}
 	gArgs, gReply = getArgs([]byte("cccc"), rangeA.Desc().RaftID, store.StoreID())
-	if err := store.ExecuteCmd(proto.Get, gArgs, gReply); err != nil ||
+	if err := store.ExecuteCmd(gArgs, gReply); err != nil ||
 		!bytes.Equal(gReply.Value.Bytes, content) {
 		t.Fatal(err)
 	}
@@ -190,25 +191,25 @@ func TestStoreRangeMergeLastRange(t *testing.T) {
 
 	// Merge last range.
 	args, reply := adminMergeArgs(engine.KeyMin, 1, store.StoreID())
-	if err := store.ExecuteCmd(proto.AdminMerge, args, reply); err != nil {
+	if err := store.ExecuteCmd(args, reply); err != nil {
 		t.Fatalf("merge of last range should be a noop: %s", err)
 	}
 }
 
-// disabledTestStoreRangeMergeNonConsecutive attempts to merge two ranges
+// TestStoreRangeMergeNonConsecutive attempts to merge two ranges
 // that are not on same store.
-func disabledTestStoreRangeMergeNonConsecutive(t *testing.T) {
+func TestStoreRangeMergeNonConsecutive(t *testing.T) {
 	defer leaktest.AfterTest(t)
 	store, stopper := createTestStore(t)
 	defer stopper.Stop()
 
 	// Split into 3 ranges
 	argsSplit, replySplit := adminSplitArgs(engine.KeyMin, []byte("d"), 1, store.StoreID())
-	if err := store.ExecuteCmd(proto.AdminSplit, argsSplit, replySplit); err != nil {
+	if err := store.ExecuteCmd(argsSplit, replySplit); err != nil {
 		t.Fatalf("Can't split range %s", err)
 	}
 	argsSplit, replySplit = adminSplitArgs(engine.KeyMin, []byte("b"), 1, store.StoreID())
-	if err := store.ExecuteCmd(proto.AdminSplit, argsSplit, replySplit); err != nil {
+	if err := store.ExecuteCmd(argsSplit, replySplit); err != nil {
 		t.Fatalf("Can't split range %s", err)
 	}
 
@@ -226,12 +227,30 @@ func disabledTestStoreRangeMergeNonConsecutive(t *testing.T) {
 		log.Errorf("split ranges keys are equal %q!=%q", rangeA.Desc().StartKey, rangeC.Desc().StartKey)
 	}
 
-	// Remove range B from store and attempt to merge.
-	store.RemoveRange(rangeB)
+	// Remove range B from store and attempt to merge. This is a bit of a hack and leaves some
+	// internals in an inconsistent state, so we must re-add the range later.
+	// This is sufficient for now to generate the "ranges not collocated" error; if this changes
+	// in the future we could make this test more realistic by using a multiTestContext
+	// and ChangeReplicas to arrange two ranges onto different stores/nodes.
+	//
+	// Wait for the leader lease to ensure things are quiescent before removing the range.
+	// See #702 and TestStoreExecuteCmdOutOfRange.
+	// TODO(bdarnell): refactor this test to rebalance the range onto a separate node
+	// when this is supported.
+	rangeB.WaitForLeaderLease(t)
+	if err := store.RemoveRange(rangeB); err != nil {
+		t.Fatal(err)
+	}
 
 	argsMerge, replyMerge := adminMergeArgs(rangeA.Desc().StartKey, 1, store.StoreID())
 	rangeA.AdminMerge(argsMerge, replyMerge)
-	if replyMerge.Error == nil {
-		t.Fatal("Should not be able to merge two ranges that are not consecutive on store")
+	if replyMerge.Error == nil ||
+		!strings.Contains(replyMerge.Error.String(), "ranges not collocated") {
+		t.Fatalf("did not got expected error; got %s", replyMerge.Error)
+	}
+
+	// Re-add the range. This is necessary for a clean shutdown.
+	if err := store.AddRange(rangeB); err != nil {
+		t.Fatal(err)
 	}
 }

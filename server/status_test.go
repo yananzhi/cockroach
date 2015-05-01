@@ -40,14 +40,14 @@ import (
 // Cockroach KV client address is set to the address of the test server.
 func startStatusServer() (*httptest.Server, *util.Stopper) {
 	stopper := util.NewStopper()
-	db, err := BootstrapCluster("cluster-1", engine.NewInMem(proto.Attributes{}, 1<<20), stopper)
+	db, err := BootstrapCluster("cluster-1", []engine.Engine{engine.NewInMem(proto.Attributes{}, 1<<20)}, stopper)
 	if err != nil {
 		log.Fatal(err)
 	}
 	status := newStatusServer(db, nil)
 	mux := http.NewServeMux()
 	status.registerHandlers(mux)
-	httpServer := httptest.NewServer(mux)
+	httpServer := httptest.NewTLSServer(mux)
 	stopper.AddCloser(httpServer)
 	return httpServer, stopper
 }
@@ -71,7 +71,7 @@ func TestStatusLocalStacks(t *testing.T) {
 // Json results. The content type of the responses is always
 // "application/json".
 func TestStatusJson(t *testing.T) {
-	s := startTestServer(t)
+	s := StartTestServer(t)
 	defer s.Stop()
 
 	type TestCase struct {
@@ -83,7 +83,7 @@ func TestStatusJson(t *testing.T) {
 		{statusKeyPrefix, "{}"},
 		{statusNodesKeyPrefix, "\"nodes\": null"},
 	}
-	// Test the /_status/local/stacks endpoint only in a go release branch.
+	// Test the /_status/local/ endpoint only in a go release branch.
 	if !strings.HasPrefix(runtime.Version(), "devel") {
 		testCases = append(testCases, TestCase{statusLocalKeyPrefix, `{
   "buildInfo": {
@@ -95,15 +95,19 @@ func TestStatusJson(t *testing.T) {
 }`})
 	}
 
+	httpClient, err := testContext.GetHTTPClient()
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, spec := range testCases {
 		contentTypes := []string{"application/json", "application/x-protobuf", "text/yaml"}
 		for _, contentType := range contentTypes {
-			req, err := http.NewRequest("GET", "http://"+s.Addr+spec.keyPrefix, nil)
+			req, err := http.NewRequest("GET", testContext.RequestScheme()+"://"+s.ServingAddr()+spec.keyPrefix, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
 			req.Header.Set("Accept", contentType)
-			resp, err := http.DefaultClient.Do(req)
+			resp, err := httpClient.Do(req)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -129,7 +133,7 @@ func TestStatusJson(t *testing.T) {
 // TestStatusGossipJson ensures that the output response for the full gossip
 // info contains the required fields.
 func TestStatusGossipJson(t *testing.T) {
-	s := startTestServer(t)
+	s := StartTestServer(t)
 	defer s.Stop()
 
 	type prefixedInfo struct {
@@ -163,15 +167,19 @@ func TestStatusGossipJson(t *testing.T) {
 		} `json:"infos"`
 	}
 
+	httpClient, err := testContext.GetHTTPClient()
+	if err != nil {
+		t.Fatal(err)
+	}
 	contentTypes := []string{"application/json", "application/x-protobuf", "text/yaml"}
 	for _, contentType := range contentTypes {
-		req, err := http.NewRequest("GET", "http://"+s.Addr+statusGossipKeyPrefix, nil)
+		req, err := http.NewRequest("GET", testContext.RequestScheme()+"://"+s.ServingAddr()+statusGossipKeyPrefix, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
 		req.Header.Set("Accept", contentType)
 
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := httpClient.Do(req)
 		if err != nil {
 			t.Fatal(err)
 		}

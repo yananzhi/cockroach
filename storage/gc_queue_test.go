@@ -96,7 +96,7 @@ func TestGCQueueShouldQueue(t *testing.T) {
 		// zero, this will translate into non live bytes.  Also write
 		// intent count. Note: the actual accounting on bytes is fictional
 		// in this test.
-		stats := engine.MVCCStats{
+		stats := proto.MVCCStats{
 			KeyBytes:    test.gcBytes,
 			IntentCount: test.intentCount,
 			IntentAge:   test.intentAge,
@@ -177,7 +177,7 @@ func TestGCQueueProcess(t *testing.T) {
 		{key9, ts3, true, false},
 	}
 
-	for _, datum := range data {
+	for i, datum := range data {
 		if datum.del {
 			dArgs, dReply := deleteArgs(datum.key, tc.rng.Desc().RaftID, tc.store.StoreID())
 			dArgs.Timestamp = datum.ts
@@ -185,8 +185,8 @@ func TestGCQueueProcess(t *testing.T) {
 				dArgs.Txn = newTransaction("test", datum.key, 1, proto.SERIALIZABLE, tc.clock)
 				dArgs.Txn.Timestamp = datum.ts
 			}
-			if err := tc.rng.AddCmd(proto.Delete, dArgs, dReply, true); err != nil {
-				t.Fatal(err)
+			if err := tc.rng.AddCmd(dArgs, dReply, true); err != nil {
+				t.Fatalf("%d: could not delete data: %s", i, err)
 			}
 		} else {
 			pArgs, pReply := putArgs(datum.key, []byte("value"), tc.rng.Desc().RaftID, tc.store.StoreID())
@@ -195,8 +195,8 @@ func TestGCQueueProcess(t *testing.T) {
 				pArgs.Txn = newTransaction("test", datum.key, 1, proto.SERIALIZABLE, tc.clock)
 				pArgs.Txn.Timestamp = datum.ts
 			}
-			if err := tc.rng.AddCmd(proto.Put, pArgs, pReply, true); err != nil {
-				t.Fatal(err)
+			if err := tc.rng.AddCmd(pArgs, pReply, true); err != nil {
+				t.Fatalf("%d: could not put data: %s", i, err)
 			}
 		}
 	}

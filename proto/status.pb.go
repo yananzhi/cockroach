@@ -19,42 +19,30 @@ var _ = math.Inf
 
 // StoreStatus contains the stats needed to calculate the current status of a
 // store.
-// TODO(bram): add significantly more statistics.
 type StoreStatus struct {
-	// The storeID for this store.
-	StoreID StoreID `protobuf:"varint,1,opt,name=store_id,customtype=StoreID" json:"store_id"`
-	// The node id associated with this store.
-	NodeID NodeID `protobuf:"varint,2,opt,name=node_id,customtype=NodeID" json:"node_id"`
-	// A list of the raft_ids (ranges) available through this store.
-	RaftIDs []int64 `protobuf:"varint,3,rep,name=raft_ids" json:"raft_ids"`
-	// Time based statistics.
-	// The last time this was updated, note that this is not the time it was
-	// written to the DB, but when this measurement was taken.
-	UpdatedAt int64 `protobuf:"varint,4,opt,name=updated_at" json:"updated_at"`
-	// The last time this node was started.
-	StartedAt int64 `protobuf:"varint,5,opt,name=started_at" json:"started_at"`
-	// Size based statistics.
-	// The number of bytes currently being used by this store.
-	UsedBytes int64 `protobuf:"varint,6,opt,name=used_bytes" json:"used_bytes"`
-	// The maximum number of bytes available.
-	MaxBytes         int64  `protobuf:"varint,7,opt,name=max_bytes" json:"max_bytes"`
-	XXX_unrecognized []byte `json:"-"`
+	Desc             StoreDescriptor `protobuf:"bytes,1,opt,name=desc" json:"desc"`
+	NodeID           NodeID          `protobuf:"varint,2,opt,name=node_id,customtype=NodeID" json:"node_id"`
+	RangeCount       int32           `protobuf:"varint,3,opt,name=range_count" json:"range_count"`
+	StartedAt        int64           `protobuf:"varint,4,opt,name=started_at" json:"started_at"`
+	UpdatedAt        int64           `protobuf:"varint,5,opt,name=updated_at" json:"updated_at"`
+	Stats            MVCCStats       `protobuf:"bytes,6,opt,name=stats" json:"stats"`
+	XXX_unrecognized []byte          `json:"-"`
 }
 
 func (m *StoreStatus) Reset()         { *m = StoreStatus{} }
 func (m *StoreStatus) String() string { return proto1.CompactTextString(m) }
 func (*StoreStatus) ProtoMessage()    {}
 
-func (m *StoreStatus) GetRaftIDs() []int64 {
+func (m *StoreStatus) GetDesc() StoreDescriptor {
 	if m != nil {
-		return m.RaftIDs
+		return m.Desc
 	}
-	return nil
+	return StoreDescriptor{}
 }
 
-func (m *StoreStatus) GetUpdatedAt() int64 {
+func (m *StoreStatus) GetRangeCount() int32 {
 	if m != nil {
-		return m.UpdatedAt
+		return m.RangeCount
 	}
 	return 0
 }
@@ -66,18 +54,76 @@ func (m *StoreStatus) GetStartedAt() int64 {
 	return 0
 }
 
-func (m *StoreStatus) GetUsedBytes() int64 {
+func (m *StoreStatus) GetUpdatedAt() int64 {
 	if m != nil {
-		return m.UsedBytes
+		return m.UpdatedAt
 	}
 	return 0
 }
 
-func (m *StoreStatus) GetMaxBytes() int64 {
+func (m *StoreStatus) GetStats() MVCCStats {
 	if m != nil {
-		return m.MaxBytes
+		return m.Stats
+	}
+	return MVCCStats{}
+}
+
+// NodeStatus contains the stats needed to calculate the current status of a
+// node.
+type NodeStatus struct {
+	Desc             NodeDescriptor `protobuf:"bytes,1,opt,name=desc" json:"desc"`
+	StoreIDs         []int32        `protobuf:"varint,2,rep,name=store_ids" json:"store_ids"`
+	RangeCount       int32          `protobuf:"varint,3,opt,name=range_count" json:"range_count"`
+	StartedAt        int64          `protobuf:"varint,4,opt,name=started_at" json:"started_at"`
+	UpdatedAt        int64          `protobuf:"varint,5,opt,name=updated_at" json:"updated_at"`
+	Stats            MVCCStats      `protobuf:"bytes,6,opt,name=stats" json:"stats"`
+	XXX_unrecognized []byte         `json:"-"`
+}
+
+func (m *NodeStatus) Reset()         { *m = NodeStatus{} }
+func (m *NodeStatus) String() string { return proto1.CompactTextString(m) }
+func (*NodeStatus) ProtoMessage()    {}
+
+func (m *NodeStatus) GetDesc() NodeDescriptor {
+	if m != nil {
+		return m.Desc
+	}
+	return NodeDescriptor{}
+}
+
+func (m *NodeStatus) GetStoreIDs() []int32 {
+	if m != nil {
+		return m.StoreIDs
+	}
+	return nil
+}
+
+func (m *NodeStatus) GetRangeCount() int32 {
+	if m != nil {
+		return m.RangeCount
 	}
 	return 0
+}
+
+func (m *NodeStatus) GetStartedAt() int64 {
+	if m != nil {
+		return m.StartedAt
+	}
+	return 0
+}
+
+func (m *NodeStatus) GetUpdatedAt() int64 {
+	if m != nil {
+		return m.UpdatedAt
+	}
+	return 0
+}
+
+func (m *NodeStatus) GetStats() MVCCStats {
+	if m != nil {
+		return m.Stats
+	}
+	return MVCCStats{}
 }
 
 func init() {
@@ -102,20 +148,29 @@ func (m *StoreStatus) Unmarshal(data []byte) error {
 		wireType := int(wire & 0x7)
 		switch fieldNum {
 		case 1:
-			if wireType != 0 {
-				return fmt.Errorf("proto: wrong wireType = %d for field StoreID", wireType)
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Desc", wireType)
 			}
+			var msglen int
 			for shift := uint(0); ; shift += 7 {
 				if index >= l {
 					return io.ErrUnexpectedEOF
 				}
 				b := data[index]
 				index++
-				m.StoreID |= (StoreID(b) & 0x7F) << shift
+				msglen |= (int(b) & 0x7F) << shift
 				if b < 0x80 {
 					break
 				}
 			}
+			postIndex := index + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if err := m.Desc.Unmarshal(data[index:postIndex]); err != nil {
+				return err
+			}
+			index = postIndex
 		case 2:
 			if wireType != 0 {
 				return fmt.Errorf("proto: wrong wireType = %d for field NodeID", wireType)
@@ -133,37 +188,20 @@ func (m *StoreStatus) Unmarshal(data []byte) error {
 			}
 		case 3:
 			if wireType != 0 {
-				return fmt.Errorf("proto: wrong wireType = %d for field RaftIDs", wireType)
+				return fmt.Errorf("proto: wrong wireType = %d for field RangeCount", wireType)
 			}
-			var v int64
 			for shift := uint(0); ; shift += 7 {
 				if index >= l {
 					return io.ErrUnexpectedEOF
 				}
 				b := data[index]
 				index++
-				v |= (int64(b) & 0x7F) << shift
+				m.RangeCount |= (int32(b) & 0x7F) << shift
 				if b < 0x80 {
 					break
 				}
 			}
-			m.RaftIDs = append(m.RaftIDs, v)
 		case 4:
-			if wireType != 0 {
-				return fmt.Errorf("proto: wrong wireType = %d for field UpdatedAt", wireType)
-			}
-			for shift := uint(0); ; shift += 7 {
-				if index >= l {
-					return io.ErrUnexpectedEOF
-				}
-				b := data[index]
-				index++
-				m.UpdatedAt |= (int64(b) & 0x7F) << shift
-				if b < 0x80 {
-					break
-				}
-			}
-		case 5:
 			if wireType != 0 {
 				return fmt.Errorf("proto: wrong wireType = %d for field StartedAt", wireType)
 			}
@@ -178,9 +216,131 @@ func (m *StoreStatus) Unmarshal(data []byte) error {
 					break
 				}
 			}
+		case 5:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field UpdatedAt", wireType)
+			}
+			for shift := uint(0); ; shift += 7 {
+				if index >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := data[index]
+				index++
+				m.UpdatedAt |= (int64(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
 		case 6:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Stats", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if index >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := data[index]
+				index++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			postIndex := index + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if err := m.Stats.Unmarshal(data[index:postIndex]); err != nil {
+				return err
+			}
+			index = postIndex
+		default:
+			var sizeOfWire int
+			for {
+				sizeOfWire++
+				wire >>= 7
+				if wire == 0 {
+					break
+				}
+			}
+			index -= sizeOfWire
+			skippy, err := github_com_gogo_protobuf_proto.Skip(data[index:])
+			if err != nil {
+				return err
+			}
+			if (index + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.XXX_unrecognized = append(m.XXX_unrecognized, data[index:index+skippy]...)
+			index += skippy
+		}
+	}
+	return nil
+}
+func (m *NodeStatus) Unmarshal(data []byte) error {
+	l := len(data)
+	index := 0
+	for index < l {
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if index >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := data[index]
+			index++
+			wire |= (uint64(b) & 0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		switch fieldNum {
+		case 1:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Desc", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if index >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := data[index]
+				index++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			postIndex := index + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if err := m.Desc.Unmarshal(data[index:postIndex]); err != nil {
+				return err
+			}
+			index = postIndex
+		case 2:
 			if wireType != 0 {
-				return fmt.Errorf("proto: wrong wireType = %d for field UsedBytes", wireType)
+				return fmt.Errorf("proto: wrong wireType = %d for field StoreIDs", wireType)
+			}
+			var v int32
+			for shift := uint(0); ; shift += 7 {
+				if index >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := data[index]
+				index++
+				v |= (int32(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			m.StoreIDs = append(m.StoreIDs, v)
+		case 3:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field RangeCount", wireType)
 			}
 			for shift := uint(0); ; shift += 7 {
 				if index >= l {
@@ -188,14 +348,14 @@ func (m *StoreStatus) Unmarshal(data []byte) error {
 				}
 				b := data[index]
 				index++
-				m.UsedBytes |= (int64(b) & 0x7F) << shift
+				m.RangeCount |= (int32(b) & 0x7F) << shift
 				if b < 0x80 {
 					break
 				}
 			}
-		case 7:
+		case 4:
 			if wireType != 0 {
-				return fmt.Errorf("proto: wrong wireType = %d for field MaxBytes", wireType)
+				return fmt.Errorf("proto: wrong wireType = %d for field StartedAt", wireType)
 			}
 			for shift := uint(0); ; shift += 7 {
 				if index >= l {
@@ -203,11 +363,50 @@ func (m *StoreStatus) Unmarshal(data []byte) error {
 				}
 				b := data[index]
 				index++
-				m.MaxBytes |= (int64(b) & 0x7F) << shift
+				m.StartedAt |= (int64(b) & 0x7F) << shift
 				if b < 0x80 {
 					break
 				}
 			}
+		case 5:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field UpdatedAt", wireType)
+			}
+			for shift := uint(0); ; shift += 7 {
+				if index >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := data[index]
+				index++
+				m.UpdatedAt |= (int64(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 6:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Stats", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if index >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := data[index]
+				index++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			postIndex := index + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if err := m.Stats.Unmarshal(data[index:postIndex]); err != nil {
+				return err
+			}
+			index = postIndex
 		default:
 			var sizeOfWire int
 			for {
@@ -234,17 +433,35 @@ func (m *StoreStatus) Unmarshal(data []byte) error {
 func (m *StoreStatus) Size() (n int) {
 	var l int
 	_ = l
-	n += 1 + sovStatus(uint64(m.StoreID))
+	l = m.Desc.Size()
+	n += 1 + l + sovStatus(uint64(l))
 	n += 1 + sovStatus(uint64(m.NodeID))
-	if len(m.RaftIDs) > 0 {
-		for _, e := range m.RaftIDs {
+	n += 1 + sovStatus(uint64(m.RangeCount))
+	n += 1 + sovStatus(uint64(m.StartedAt))
+	n += 1 + sovStatus(uint64(m.UpdatedAt))
+	l = m.Stats.Size()
+	n += 1 + l + sovStatus(uint64(l))
+	if m.XXX_unrecognized != nil {
+		n += len(m.XXX_unrecognized)
+	}
+	return n
+}
+
+func (m *NodeStatus) Size() (n int) {
+	var l int
+	_ = l
+	l = m.Desc.Size()
+	n += 1 + l + sovStatus(uint64(l))
+	if len(m.StoreIDs) > 0 {
+		for _, e := range m.StoreIDs {
 			n += 1 + sovStatus(uint64(e))
 		}
 	}
-	n += 1 + sovStatus(uint64(m.UpdatedAt))
+	n += 1 + sovStatus(uint64(m.RangeCount))
 	n += 1 + sovStatus(uint64(m.StartedAt))
-	n += 1 + sovStatus(uint64(m.UsedBytes))
-	n += 1 + sovStatus(uint64(m.MaxBytes))
+	n += 1 + sovStatus(uint64(m.UpdatedAt))
+	l = m.Stats.Size()
+	n += 1 + l + sovStatus(uint64(l))
 	if m.XXX_unrecognized != nil {
 		n += len(m.XXX_unrecognized)
 	}
@@ -279,31 +496,87 @@ func (m *StoreStatus) MarshalTo(data []byte) (n int, err error) {
 	_ = i
 	var l int
 	_ = l
-	data[i] = 0x8
+	data[i] = 0xa
 	i++
-	i = encodeVarintStatus(data, i, uint64(m.StoreID))
+	i = encodeVarintStatus(data, i, uint64(m.Desc.Size()))
+	n1, err := m.Desc.MarshalTo(data[i:])
+	if err != nil {
+		return 0, err
+	}
+	i += n1
 	data[i] = 0x10
 	i++
 	i = encodeVarintStatus(data, i, uint64(m.NodeID))
-	if len(m.RaftIDs) > 0 {
-		for _, num := range m.RaftIDs {
-			data[i] = 0x18
+	data[i] = 0x18
+	i++
+	i = encodeVarintStatus(data, i, uint64(m.RangeCount))
+	data[i] = 0x20
+	i++
+	i = encodeVarintStatus(data, i, uint64(m.StartedAt))
+	data[i] = 0x28
+	i++
+	i = encodeVarintStatus(data, i, uint64(m.UpdatedAt))
+	data[i] = 0x32
+	i++
+	i = encodeVarintStatus(data, i, uint64(m.Stats.Size()))
+	n2, err := m.Stats.MarshalTo(data[i:])
+	if err != nil {
+		return 0, err
+	}
+	i += n2
+	if m.XXX_unrecognized != nil {
+		i += copy(data[i:], m.XXX_unrecognized)
+	}
+	return i, nil
+}
+
+func (m *NodeStatus) Marshal() (data []byte, err error) {
+	size := m.Size()
+	data = make([]byte, size)
+	n, err := m.MarshalTo(data)
+	if err != nil {
+		return nil, err
+	}
+	return data[:n], nil
+}
+
+func (m *NodeStatus) MarshalTo(data []byte) (n int, err error) {
+	var i int
+	_ = i
+	var l int
+	_ = l
+	data[i] = 0xa
+	i++
+	i = encodeVarintStatus(data, i, uint64(m.Desc.Size()))
+	n3, err := m.Desc.MarshalTo(data[i:])
+	if err != nil {
+		return 0, err
+	}
+	i += n3
+	if len(m.StoreIDs) > 0 {
+		for _, num := range m.StoreIDs {
+			data[i] = 0x10
 			i++
 			i = encodeVarintStatus(data, i, uint64(num))
 		}
 	}
+	data[i] = 0x18
+	i++
+	i = encodeVarintStatus(data, i, uint64(m.RangeCount))
 	data[i] = 0x20
 	i++
-	i = encodeVarintStatus(data, i, uint64(m.UpdatedAt))
+	i = encodeVarintStatus(data, i, uint64(m.StartedAt))
 	data[i] = 0x28
 	i++
-	i = encodeVarintStatus(data, i, uint64(m.StartedAt))
-	data[i] = 0x30
+	i = encodeVarintStatus(data, i, uint64(m.UpdatedAt))
+	data[i] = 0x32
 	i++
-	i = encodeVarintStatus(data, i, uint64(m.UsedBytes))
-	data[i] = 0x38
-	i++
-	i = encodeVarintStatus(data, i, uint64(m.MaxBytes))
+	i = encodeVarintStatus(data, i, uint64(m.Stats.Size()))
+	n4, err := m.Stats.MarshalTo(data[i:])
+	if err != nil {
+		return 0, err
+	}
+	i += n4
 	if m.XXX_unrecognized != nil {
 		i += copy(data[i:], m.XXX_unrecognized)
 	}

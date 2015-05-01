@@ -23,6 +23,7 @@ import (
 	"math"
 	"reflect"
 	"regexp"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -33,6 +34,7 @@ import (
 	"github.com/cockroachdb/cockroach/multiraft/storagetest"
 	"github.com/cockroachdb/cockroach/proto"
 	"github.com/cockroachdb/cockroach/rpc"
+	"github.com/cockroachdb/cockroach/security"
 	"github.com/cockroachdb/cockroach/storage/engine"
 	"github.com/cockroachdb/cockroach/util"
 	"github.com/cockroachdb/cockroach/util/hlc"
@@ -80,12 +82,14 @@ func testRangeDescriptor() *proto.RangeDescriptor {
 type bootstrapMode int
 
 const (
-	// Use Store.BootstrapRange, which writes the range descriptor and other metadata.
-	// Most tests should use this mode because it more closely resembles the real world.
+	// Use Store.BootstrapRange, which writes the range descriptor and
+	// other metadata. Most tests should use this mode because it more
+	// closely resembles the real world.
 	bootstrapRangeWithMetadata bootstrapMode = iota
-	// Create a range with NewRange and Store.AddRange. The store's data will
-	// be persisted but metadata will not. This mode is provided for backwards compatiblity
-	// for tests that expect the store to initially be empty.
+	// Create a range with NewRange and Store.AddRange. The store's data
+	// will be persisted but metadata will not. This mode is provided
+	// for backwards compatibility for tests that expect the store to
+	// initially be empty.
 	bootstrapRangeOnly
 )
 
@@ -104,13 +108,20 @@ type testContext struct {
 	clock         *hlc.Clock
 	stopper       *util.Stopper
 	bootstrapMode bootstrapMode
+	feed          *util.Feed
+	// when true, do not automatically create the Raft group for the first
+	// range and wait for elections.
+	dormantRaft bool
 }
 
 // testContext.Start initializes the test context with a single range covering the
 // entire keyspace.
-func (tc *testContext) Start(t *testing.T) {
+func (tc *testContext) Start(t testing.TB) {
+	if tc.stopper == nil {
+		tc.stopper = util.NewStopper()
+	}
 	if tc.gossip == nil {
-		rpcContext := rpc.NewContext(hlc.NewClock(hlc.UnixNano), rpc.LoadInsecureTLSConfig())
+		rpcContext := rpc.NewContext(hlc.NewClock(hlc.UnixNano), security.LoadInsecureTLSConfig(), tc.stopper)
 		tc.gossip = gossip.New(rpcContext, gossip.TestInterval, gossip.TestBootstrap)
 	}
 	if tc.manualClock == nil {
@@ -125,13 +136,18 @@ func (tc *testContext) Start(t *testing.T) {
 	if tc.transport == nil {
 		tc.transport = multiraft.NewLocalRPCTransport()
 	}
-	if tc.stopper == nil {
-		tc.stopper = util.NewStopper()
-	}
 	tc.stopper.AddCloser(tc.transport)
+	if tc.feed != nil {
+		tc.stopper.AddCloser(tc.feed)
+	}
 
 	if tc.store == nil {
-		tc.store = NewStore(tc.clock, tc.engine, nil, tc.gossip, tc.transport, TestStoreConfig)
+		ctx := TestStoreContext
+		ctx.Clock = tc.clock
+		ctx.Gossip = tc.gossip
+		ctx.Transport = tc.transport
+		ctx.EventFeed = tc.feed
+		tc.store = NewStore(ctx, tc.engine, &proto.NodeDescriptor{NodeID: 1})
 		if err := tc.store.Bootstrap(proto.StoreIdent{NodeID: 1, StoreID: 1}, tc.stopper); err != nil {
 			t.Fatal(err)
 		}
@@ -143,7 +159,7 @@ func (tc *testContext) Start(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		tc.store.db = client.NewKV(nil, &testSender{store: tc.store})
+		tc.store.ctx.DB = client.NewKV(nil, &testSender{store: tc.store})
 		if err := tc.store.Start(tc.stopper); err != nil {
 			t.Fatal(err)
 		}
@@ -175,7 +191,7 @@ func (tc *testContext) Stop() {
 }
 
 // initConfigs creates default configuration entries.
-func initConfigs(e engine.Engine, t *testing.T) {
+func initConfigs(e engine.Engine, t testing.TB) {
 	if err := engine.MVCCPutProto(e, nil, engine.KeyConfigAccountingPrefix, proto.MinTimestamp, nil, &testDefaultAcctConfig); err != nil {
 		t.Fatal(err)
 	}
@@ -220,7 +236,10 @@ func TestRangeContains(t *testing.T) {
 	clock := hlc.NewClock(hlc.UnixNano)
 	transport := multiraft.NewLocalRPCTransport()
 	defer transport.Close()
-	store := NewStore(clock, e, nil, nil, multiraft.NewLocalRPCTransport(), TestStoreConfig)
+	ctx := TestStoreContext
+	ctx.Clock = clock
+	ctx.Transport = multiraft.NewLocalRPCTransport()
+	store := NewStore(ctx, e, &proto.NodeDescriptor{NodeID: 1})
 	r, err := NewRange(desc, store)
 	if err != nil {
 		t.Fatal(err)
@@ -240,7 +259,24 @@ func TestRangeContains(t *testing.T) {
 	}
 }
 
-func TestRangeCanService(t *testing.T) {
+func setLeaderLease(t *testing.T, r *Range, l *proto.Lease) {
+	args := &proto.InternalLeaderLeaseRequest{Lease: *l}
+	reply := &proto.InternalLeaderLeaseResponse{}
+	errChan, pendingCmd := r.proposeRaftCommand(args, reply)
+	var err error
+	if err = <-errChan; err == nil {
+		// Next if the command was commited, wait for the range to apply it.
+		err = <-pendingCmd.done
+	}
+	if err != nil {
+		t.Errorf("failed to set lease: %s", err)
+	}
+}
+
+// TestRangeReadConsistency verifies behavior of the range under
+// different read consistencies. Note that this unittest plays
+// fast and loose with granting leader leases.
+func TestRangeReadConsistency(t *testing.T) {
 	defer leaktest.AfterTest(t)
 	tc := testContext{}
 	tc.Start(t)
@@ -249,28 +285,242 @@ func TestRangeCanService(t *testing.T) {
 	gArgs, gReply := getArgs(proto.Key("a"), 1, tc.store.StoreID())
 	gArgs.Timestamp = tc.clock.Now()
 
+	// Try consistent read and verify success.
+	if err := tc.rng.AddCmd(gArgs, gReply, true); err != nil {
+		t.Errorf("expected success on consistent read: %s", err)
+	}
+
 	// Try a consensus read and verify error.
 	gArgs.ReadConsistency = proto.CONSENSUS
-	if err := tc.rng.AddCmd(proto.Get, gArgs, gReply, true); err == nil {
+	if err := tc.rng.AddCmd(gArgs, gReply, true); err == nil {
 		t.Errorf("expected error on consensus read")
 	}
 
 	// Try an inconsistent read within a transaction.
 	gArgs.ReadConsistency = proto.INCONSISTENT
 	gArgs.Txn = newTransaction("test", proto.Key("a"), 1, proto.SERIALIZABLE, tc.clock)
-	if err := tc.rng.AddCmd(proto.Get, gArgs, gReply, true); err == nil {
+	if err := tc.rng.AddCmd(gArgs, gReply, true); err == nil {
 		t.Errorf("expected error on inconsistent read within a txn")
 	}
 
-	// TODO(spencer): verify non-leader inconsistent read works.
-
-	// Verify range checking.
-	splitTestRange(tc.store, proto.Key("a"), proto.Key("a"), t)
-	gArgs.Key = proto.Key("b")
+	// Lose the lease and verify CONSISTENT reads receive NotLeaderError
+	// and INCONSISTENT reads work as expected.
+	start := tc.rng.getLease().Expiration.Add(1, 0)
+	tc.manualClock.Set(start.WallTime)
+	setLeaderLease(t, tc.rng, &proto.Lease{
+		Start:      start,
+		Expiration: start.Add(10, 0),
+		RaftNodeID: uint64(MakeRaftNodeID(2, 2)), // a different node
+	})
+	gArgs.ReadConsistency = proto.CONSISTENT
 	gArgs.Txn = nil
-	err := tc.rng.AddCmd(proto.Get, gArgs, gReply, true)
+	err := tc.rng.AddCmd(gArgs, gReply, true)
+	if _, ok := err.(*proto.NotLeaderError); !ok {
+		t.Errorf("expected not leader error; got %s", err)
+	}
+
+	gArgs.ReadConsistency = proto.INCONSISTENT
+	if err := tc.rng.AddCmd(gArgs, gReply, true); err != nil {
+		t.Errorf("expected success reading with inconsistent: %s", err)
+	}
+}
+
+func TestRangeRangeBoundsChecking(t *testing.T) {
+	defer leaktest.AfterTest(t)
+	tc := testContext{}
+	tc.Start(t)
+	defer tc.Stop()
+
+	splitTestRange(tc.store, proto.Key("a"), proto.Key("a"), t)
+	gArgs, gReply := getArgs(proto.Key("b"), 1, tc.store.StoreID())
+	err := tc.rng.AddCmd(gArgs, gReply, true)
 	if _, ok := err.(*proto.RangeKeyMismatchError); !ok {
 		t.Errorf("expected range key mismatch error: %s", err)
+	}
+}
+
+func TestRangeHasLeaderLease(t *testing.T) {
+	defer leaktest.AfterTest(t)
+	tc := testContext{}
+	tc.Start(t)
+	defer tc.Stop()
+	tc.clock.SetMaxOffset(maxClockOffset)
+
+	if held, _ := tc.rng.HasLeaderLease(tc.clock.Now()); held {
+		t.Errorf("expected no lease on range start")
+	}
+	now := tc.clock.Now()
+	setLeaderLease(t, tc.rng, &proto.Lease{
+		Start:      now,
+		Expiration: now.Add(10, 0),
+		RaftNodeID: uint64(MakeRaftNodeID(2, 2)),
+	})
+	if held, expired := tc.rng.HasLeaderLease(tc.clock.Now()); held || expired {
+		t.Errorf("expected another replica to have leader lease")
+	}
+
+	// Advance clock past expiration and verify that another has
+	// leader lease will not be true.
+	tc.manualClock.Set(11) // time is 11ns
+	if held, expired := tc.rng.HasLeaderLease(tc.clock.Now()); held || !expired {
+		t.Errorf("expected another replica to have expired lease")
+	}
+}
+
+func TestRangeNotLeaderError(t *testing.T) {
+	defer leaktest.AfterTest(t)
+	tc := testContext{}
+	tc.Start(t)
+	defer tc.Stop()
+
+	now := tc.clock.Now()
+	setLeaderLease(t, tc.rng, &proto.Lease{
+		Start:      now,
+		Expiration: now.Add(10, 0),
+		RaftNodeID: uint64(MakeRaftNodeID(2, 2)),
+	})
+
+	header := proto.RequestHeader{
+		Key:       proto.Key("a"),
+		RaftID:    tc.rng.Desc().RaftID,
+		Replica:   proto.Replica{StoreID: tc.store.StoreID()},
+		Timestamp: now,
+	}
+	testCases := []struct {
+		args  proto.Request
+		reply proto.Response
+	}{
+		// Admin split covers admin commands.
+		{&proto.AdminSplitRequest{
+			RequestHeader: header,
+			SplitKey:      proto.Key("a"),
+		},
+			&proto.AdminSplitResponse{},
+		},
+		// Get covers read-only commands.
+		{&proto.GetRequest{
+			RequestHeader: header,
+		},
+			&proto.GetResponse{},
+		},
+		// Put covers read-write commands.
+		{&proto.PutRequest{
+			RequestHeader: header,
+			Value: proto.Value{
+				Bytes: []byte("value"),
+			},
+		},
+			&proto.PutResponse{},
+		},
+	}
+
+	for i, test := range testCases {
+		err := tc.rng.AddCmd(test.args, test.reply, true)
+		if _, ok := err.(*proto.NotLeaderError); !ok {
+			t.Errorf("%d: expected not leader error: %s", i, err)
+		}
+	}
+}
+
+// TestRangeGossipConfigsOnLease verifies that config info is gossiped
+// upon acquisition of the leader lease.
+func TestRangeGossipConfigsOnLease(t *testing.T) {
+	defer leaktest.AfterTest(t)
+	tc := testContext{}
+	tc.Start(t)
+	defer tc.Stop()
+
+	// Give lease to someone else to start.
+	now := tc.clock.Now()
+	setLeaderLease(t, tc.rng, &proto.Lease{
+		Start:      now,
+		Expiration: now.Add(10, 0),
+		RaftNodeID: uint64(MakeRaftNodeID(2, 2)),
+	})
+
+	// Add a permission for a new key prefix.
+	db1Perm := proto.PermConfig{
+		Read:  []string{"spencer", "foo", "bar", "baz"},
+		Write: []string{"spencer"},
+	}
+	key := engine.MakeKey(engine.KeyConfigPermissionPrefix, proto.Key("/db1"))
+	if err := engine.MVCCPutProto(tc.engine, nil, key, proto.MinTimestamp, nil, &db1Perm); err != nil {
+		t.Fatal(err)
+	}
+
+	verifyPerm := func() bool {
+		info, err := tc.gossip.GetInfo(gossip.KeyConfigPermission)
+		if err != nil {
+			t.Fatal(err)
+		}
+		configMap := info.(PrefixConfigMap)
+		expConfigs := []*PrefixConfig{
+			{engine.KeyMin, nil, &testDefaultPermConfig},
+			{proto.Key("/db1"), nil, &db1Perm},
+			{proto.Key("/db2"), engine.KeyMin, &testDefaultPermConfig},
+		}
+		return reflect.DeepEqual([]*PrefixConfig(configMap), expConfigs)
+	}
+
+	if verifyPerm() {
+		t.Errorf("not expecting gossip of new config until lease is acquired")
+	}
+
+	// Give lease to this range.
+	tc.manualClock.Set(11 + int64(tc.clock.MaxOffset())) // advance time
+	setLeaderLease(t, tc.rng, &proto.Lease{
+		Start:      now.Add(11, 0),
+		Expiration: now.Add(20, 0),
+		RaftNodeID: uint64(tc.store.RaftNodeID()),
+	})
+	if !verifyPerm() {
+		t.Errorf("expected gossip of new config")
+	}
+}
+
+// TestRangeTSCacheLowWaterOnLease verifies that the low water mark is
+// set on the timestamp cache when the node is granted the leader
+// lease after not holding it and it is not set when the node is
+// granted the leader lease when it was the last holder.
+func TestRangeTSCacheLowWaterOnLease(t *testing.T) {
+	defer leaktest.AfterTest(t)
+	tc := testContext{}
+	tc.Start(t)
+	defer tc.Stop()
+	tc.clock.SetMaxOffset(maxClockOffset)
+
+	now := proto.Timestamp{WallTime: maxClockOffset.Nanoseconds() + 10}
+	tc.manualClock.Set(now.WallTime)
+
+	testCases := []struct {
+		nodeID      multiraft.NodeID
+		start       proto.Timestamp
+		expiration  proto.Timestamp
+		expLowWater int64
+	}{
+		// Grant the lease fresh.
+		{tc.store.RaftNodeID(), now, now.Add(10, 0), maxClockOffset.Nanoseconds()},
+		// Renew the lease.
+		{tc.store.RaftNodeID(), now.Add(15, 0), now.Add(30, 0), maxClockOffset.Nanoseconds()},
+		// Renew the lease but shorten expiration.
+		{tc.store.RaftNodeID(), now.Add(16, 0), now.Add(25, 0), maxClockOffset.Nanoseconds()},
+		// Lease is held by another.
+		{MakeRaftNodeID(2, 2), now.Add(29, 0), now.Add(50, 0), maxClockOffset.Nanoseconds()},
+		// Lease is regranted to this replica.
+		{tc.store.RaftNodeID(), now.Add(60, 0), now.Add(70, 0), now.Add(50, 0).WallTime + maxClockOffset.Nanoseconds()},
+	}
+
+	for i, test := range testCases {
+		setLeaderLease(t, tc.rng, &proto.Lease{
+			Start:      test.start,
+			Expiration: test.expiration,
+			RaftNodeID: uint64(test.nodeID),
+		})
+		// Verify expected low water mark.
+		rTS, wTS := tc.rng.tsCache.GetMax(proto.Key("a"), nil, proto.NoTxnMD5)
+		if rTS.WallTime != test.expLowWater || wTS.WallTime != test.expLowWater {
+			t.Errorf("%d: expected low water %d; got %d, %d", i, test.expLowWater, rTS.WallTime, wTS.WallTime)
+		}
 	}
 }
 
@@ -357,7 +607,7 @@ func TestRangeGossipConfigWithMultipleKeyPrefixes(t *testing.T) {
 	}
 	reply := &proto.PutResponse{}
 
-	if err := tc.rng.executeCmd(0, proto.Put, req, reply); err != nil {
+	if err := tc.rng.AddCmd(req, reply, true); err != nil {
 		t.Fatal(err)
 	}
 
@@ -399,7 +649,7 @@ func TestRangeGossipConfigUpdates(t *testing.T) {
 	}
 	reply := &proto.PutResponse{}
 
-	if err := tc.rng.executeCmd(0, proto.Put, req, reply); err != nil {
+	if err := tc.rng.AddCmd(req, reply, true); err != nil {
 		t.Fatal(err)
 	}
 
@@ -466,13 +716,13 @@ func deleteArgs(key proto.Key, raftID int64, storeID proto.StoreID) (*proto.Dele
 // readOrWriteArgs returns either get or put arguments depending on
 // value of "read". Get for true; Put for false. Returns method
 // selected and args & reply.
-func readOrWriteArgs(key proto.Key, read bool, raftID int64, storeID proto.StoreID) (string, proto.Request, proto.Response) {
+func readOrWriteArgs(key proto.Key, read bool, raftID int64, storeID proto.StoreID) (proto.Request, proto.Response) {
 	if read {
 		gArgs, gReply := getArgs(key, raftID, storeID)
-		return proto.Get, gArgs, gReply
+		return gArgs, gReply
 	}
 	pArgs, pReply := putArgs(key, []byte("value"), raftID, storeID)
-	return proto.Put, pArgs, pReply
+	return pArgs, pReply
 }
 
 // incrementArgs returns an IncrementRequest and IncrementResponse pair
@@ -613,6 +863,51 @@ func verifyErrorMatches(err error, regexpStr string, t *testing.T) {
 	}
 }
 
+// TestAcquireLeaderLease verifies that the leader lease is acquired
+// for read and write methods.
+func TestAcquireLeaderLease(t *testing.T) {
+	defer leaktest.AfterTest(t)
+
+	gArgs, gReply := getArgs([]byte("a"), 1, 0)
+	pArgs, pReply := putArgs([]byte("b"), []byte("1"), 1, 0)
+
+	testCases := []struct {
+		args  proto.Request
+		reply proto.Response
+	}{
+		{gArgs, gReply},
+		{pArgs, pReply},
+	}
+	// This is a single-replica test; since we're automatically pushing back
+	// the start of a lease as far as possible, and since there is no prior
+	// lease at the beginning, we'll basically create a lease from time zero
+	// in this test and extend it.
+	expStart := proto.ZeroTimestamp
+	for i, test := range testCases {
+		tc := testContext{}
+		tc.Start(t)
+		tc.manualClock.Set(time.Second.Nanoseconds())
+
+		test.args.Header().Timestamp = tc.clock.Now()
+
+		if err := tc.rng.AddCmd(test.args, test.reply, true); err != nil {
+			t.Fatal(err)
+		}
+		lease := tc.rng.getLease()
+		if lease == nil {
+			t.Fatalf("%d: expected lease acquisition", i)
+		}
+		// The lease may start earlier than our request timestamp, but the
+		// expiration will still be measured relative to it.
+		expExpiration := test.args.Header().Timestamp.Add(int64(defaultLeaderLeaseDuration), 0)
+		if !lease.Start.Equal(expStart) || !lease.Expiration.Equal(expExpiration) {
+			t.Errorf("%d: unexpected lease timing %s, %s; expected %s, %s",
+				i, lease.Start, lease.Expiration, expStart, expExpiration)
+		}
+		tc.Stop()
+	}
+}
+
 // TestRangeUpdateTSCache verifies that reads and writes update the
 // timestamp cache.
 func TestRangeUpdateTSCache(t *testing.T) {
@@ -625,7 +920,7 @@ func TestRangeUpdateTSCache(t *testing.T) {
 	tc.manualClock.Set(t0.Nanoseconds())
 	gArgs, gReply := getArgs([]byte("a"), 1, tc.store.StoreID())
 	gArgs.Timestamp = tc.clock.Now()
-	err := tc.rng.AddCmd(proto.Get, gArgs, gReply, true)
+	err := tc.rng.AddCmd(gArgs, gReply, true)
 	if err != nil {
 		t.Error(err)
 	}
@@ -634,7 +929,7 @@ func TestRangeUpdateTSCache(t *testing.T) {
 	tc.manualClock.Set(t1.Nanoseconds())
 	pArgs, pReply := putArgs([]byte("b"), []byte("1"), 1, tc.store.StoreID())
 	pArgs.Timestamp = tc.clock.Now()
-	err = tc.rng.AddCmd(proto.Put, pArgs, pReply, true)
+	err = tc.rng.AddCmd(pArgs, pReply, true)
 	if err != nil {
 		t.Error(err)
 	}
@@ -667,7 +962,7 @@ func TestRangeCommandQueue(t *testing.T) {
 
 	// Intercept commands with matching command IDs and block them.
 	blockingDone := make(chan struct{}, 1)
-	TestingCommandFilter = func(method string, args proto.Request, reply proto.Response) bool {
+	TestingCommandFilter = func(args proto.Request, reply proto.Response) bool {
 		if args.Header().User == "Foo" {
 			<-blockingDone
 		}
@@ -693,9 +988,9 @@ func TestRangeCommandQueue(t *testing.T) {
 		// Asynchronously put a value to the rng with blocking enabled.
 		cmd1Done := make(chan struct{})
 		go func() {
-			method, args, reply := readOrWriteArgs(key1, test.cmd1Read, tc.rng.Desc().RaftID, tc.store.StoreID())
+			args, reply := readOrWriteArgs(key1, test.cmd1Read, tc.rng.Desc().RaftID, tc.store.StoreID())
 			args.Header().User = "Foo"
-			err := tc.rng.AddCmd(method, args, reply, true)
+			err := tc.rng.AddCmd(args, reply, true)
 			if err != nil {
 				t.Fatalf("test %d: %s", i, err)
 			}
@@ -705,8 +1000,8 @@ func TestRangeCommandQueue(t *testing.T) {
 		// First, try a command for same key as cmd1 to verify it blocks.
 		cmd2Done := make(chan struct{})
 		go func() {
-			method, args, reply := readOrWriteArgs(key1, test.cmd2Read, tc.rng.Desc().RaftID, tc.store.StoreID())
-			err := tc.rng.AddCmd(method, args, reply, true)
+			args, reply := readOrWriteArgs(key1, test.cmd2Read, tc.rng.Desc().RaftID, tc.store.StoreID())
+			err := tc.rng.AddCmd(args, reply, true)
 			if err != nil {
 				t.Fatalf("test %d: %s", i, err)
 			}
@@ -716,8 +1011,8 @@ func TestRangeCommandQueue(t *testing.T) {
 		// Next, try read for a non-impacted key--should go through immediately.
 		cmd3Done := make(chan struct{})
 		go func() {
-			method, args, reply := readOrWriteArgs(key2, true, tc.rng.Desc().RaftID, tc.store.StoreID())
-			err := tc.rng.AddCmd(method, args, reply, true)
+			args, reply := readOrWriteArgs(key2, true, tc.rng.Desc().RaftID, tc.store.StoreID())
+			err := tc.rng.AddCmd(args, reply, true)
 			if err != nil {
 				t.Fatalf("test %d: %s", i, err)
 			}
@@ -769,7 +1064,7 @@ func TestRangeCommandQueueInconsistent(t *testing.T) {
 
 	key := proto.Key("key1")
 	blockingDone := make(chan struct{})
-	TestingCommandFilter = func(method string, args proto.Request, reply proto.Response) bool {
+	TestingCommandFilter = func(args proto.Request, reply proto.Response) bool {
 		if args.Header().CmdID.Random == 1 {
 			<-blockingDone
 		}
@@ -779,7 +1074,7 @@ func TestRangeCommandQueueInconsistent(t *testing.T) {
 	go func() {
 		args, reply := putArgs(key, []byte("value"), tc.rng.Desc().RaftID, tc.store.StoreID())
 		args.CmdID.Random = 1
-		err := tc.rng.AddCmd(proto.Put, args, reply, true)
+		err := tc.rng.AddCmd(args, reply, true)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -791,7 +1086,7 @@ func TestRangeCommandQueueInconsistent(t *testing.T) {
 	go func() {
 		args, reply := getArgs(key, tc.rng.Desc().RaftID, tc.store.StoreID())
 		args.ReadConsistency = proto.INCONSISTENT
-		err := tc.rng.AddCmd(proto.Get, args, reply, true)
+		err := tc.rng.AddCmd(args, reply, true)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -828,12 +1123,12 @@ func TestRangeUseTSCache(t *testing.T) {
 	tc.manualClock.Set(t0.Nanoseconds())
 	args, reply := getArgs([]byte("a"), 1, tc.store.StoreID())
 	args.Timestamp = tc.clock.Now()
-	err := tc.rng.AddCmd(proto.Get, args, reply, true)
+	err := tc.rng.AddCmd(args, reply, true)
 	if err != nil {
 		t.Error(err)
 	}
 	pArgs, pReply := putArgs([]byte("a"), []byte("value"), 1, tc.store.StoreID())
-	err = tc.rng.AddCmd(proto.Put, pArgs, pReply, true)
+	err = tc.rng.AddCmd(pArgs, pReply, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -855,12 +1150,12 @@ func TestRangeNoTSCacheInconsistent(t *testing.T) {
 	args, reply := getArgs([]byte("a"), 1, tc.store.StoreID())
 	args.Timestamp = tc.clock.Now()
 	args.ReadConsistency = proto.INCONSISTENT
-	err := tc.rng.AddCmd(proto.Get, args, reply, true)
+	err := tc.rng.AddCmd(args, reply, true)
 	if err != nil {
 		t.Error(err)
 	}
 	pArgs, pReply := putArgs([]byte("a"), []byte("value"), 1, tc.store.StoreID())
-	err = tc.rng.AddCmd(proto.Put, pArgs, pReply, true)
+	err = tc.rng.AddCmd(pArgs, pReply, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -886,19 +1181,19 @@ func TestRangeNoTSCacheUpdateOnFailure(t *testing.T) {
 		pArgs, pReply := putArgs(key, []byte("value"), 1, tc.store.StoreID())
 		pArgs.Txn = newTransaction("test", key, 1, proto.SERIALIZABLE, tc.clock)
 		pArgs.Timestamp = pArgs.Txn.Timestamp
-		if err := tc.rng.AddCmd(proto.Put, pArgs, pReply, true); err != nil {
+		if err := tc.rng.AddCmd(pArgs, pReply, true); err != nil {
 			t.Fatalf("test %d: %s", i, err)
 		}
 
 		// Now attempt read or write.
-		method, args, reply := readOrWriteArgs(key, read, tc.rng.Desc().RaftID, tc.store.StoreID())
+		args, reply := readOrWriteArgs(key, read, tc.rng.Desc().RaftID, tc.store.StoreID())
 		args.Header().Timestamp = tc.clock.Now() // later timestamp
-		if err := tc.rng.AddCmd(method, args, reply, true); err == nil {
+		if err := tc.rng.AddCmd(args, reply, true); err == nil {
 			t.Errorf("test %d: expected failure", i)
 		}
 
 		// Write the intent again -- should not have its timestamp upgraded!
-		if err := tc.rng.AddCmd(proto.Put, pArgs, pReply, true); err != nil {
+		if err := tc.rng.AddCmd(pArgs, pReply, true); err != nil {
 			t.Fatalf("test %d: %s", i, err)
 		}
 		if !pReply.Timestamp.Equal(pArgs.Timestamp) {
@@ -924,7 +1219,7 @@ func TestRangeNoTimestampIncrementWithinTxn(t *testing.T) {
 	gArgs, gReply := getArgs(key, 1, tc.store.StoreID())
 	gArgs.Txn = txn
 	gArgs.Timestamp = txn.Timestamp
-	if err := tc.rng.AddCmd(proto.Get, gArgs, gReply, true); err != nil {
+	if err := tc.rng.AddCmd(gArgs, gReply, true); err != nil {
 		t.Fatal(err)
 	}
 
@@ -932,7 +1227,7 @@ func TestRangeNoTimestampIncrementWithinTxn(t *testing.T) {
 	pArgs, pReply := putArgs(key, []byte("value"), 1, tc.store.StoreID())
 	pArgs.Txn = txn
 	pArgs.Timestamp = pArgs.Txn.Timestamp
-	if err := tc.rng.AddCmd(proto.Put, pArgs, pReply, true); err != nil {
+	if err := tc.rng.AddCmd(pArgs, pReply, true); err != nil {
 		t.Fatal(err)
 	}
 	if !pReply.Timestamp.Equal(pArgs.Timestamp) {
@@ -943,7 +1238,7 @@ func TestRangeNoTimestampIncrementWithinTxn(t *testing.T) {
 	pArgs.Txn = nil
 	expTS := pArgs.Timestamp
 	expTS.Logical++
-	if err := tc.rng.AddCmd(proto.Put, pArgs, pReply, true); err == nil {
+	if err := tc.rng.AddCmd(pArgs, pReply, true); err == nil {
 		t.Errorf("expected write intent error")
 	}
 	if !pReply.Timestamp.Equal(expTS) {
@@ -977,7 +1272,7 @@ func TestRangeIdempotence(t *testing.T) {
 			} else {
 				args.CmdID = proto.ClientCmdID{WallTime: 1, Random: int64(idx + 100)}
 			}
-			err := tc.rng.AddCmd(proto.Increment, &args, &reply, true)
+			err := tc.rng.AddCmd(&args, &reply, true)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1005,6 +1300,37 @@ func TestRangeIdempotence(t *testing.T) {
 	}
 }
 
+// TestRangeResponseCacheError verifies that an error is returned to the
+// client in the event that a response cache entry is found but is not
+// decodable.
+func TestRangeResponseCacheError(t *testing.T) {
+	defer leaktest.AfterTest(t)
+	tc := testContext{}
+	tc.Start(t)
+	defer tc.Stop()
+
+	args, reply := incrementArgs([]byte("a"), 1, 1, tc.store.StoreID())
+	args.CmdID = proto.ClientCmdID{WallTime: 1, Random: 1}
+	err := tc.rng.AddCmd(args, reply, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Overwrite repsonse cache entry with garbage for the last op.
+	key := engine.ResponseCacheKey(tc.rng.Desc().RaftID, &args.CmdID)
+	err = engine.MVCCPut(tc.engine, nil, key, proto.ZeroTimestamp, proto.Value{Bytes: []byte("\xff")}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Now try increment again and verify error.
+	reply.Reset()
+	err = tc.rng.AddCmd(args, reply, true)
+	if err == nil {
+		t.Fatal(err)
+	}
+}
+
 // TestEndTransactionBeforeHeartbeat verifies that a transaction
 // can be committed/aborted before being heartbeat.
 func TestEndTransactionBeforeHeartbeat(t *testing.T) {
@@ -1018,7 +1344,7 @@ func TestEndTransactionBeforeHeartbeat(t *testing.T) {
 		txn := newTransaction("test", key, 1, proto.SERIALIZABLE, tc.clock)
 		args, reply := endTxnArgs(txn, commit, 1, tc.store.StoreID())
 		args.Timestamp = txn.Timestamp
-		if err := tc.rng.AddCmd(proto.EndTransaction, args, reply, true); err != nil {
+		if err := tc.rng.AddCmd(args, reply, true); err != nil {
 			t.Error(err)
 		}
 		expStatus := proto.COMMITTED
@@ -1032,7 +1358,7 @@ func TestEndTransactionBeforeHeartbeat(t *testing.T) {
 		// Try a heartbeat to the already-committed transaction; should get
 		// committed txn back, but without last heartbeat timestamp set.
 		hbArgs, hbReply := heartbeatArgs(txn, 1, tc.store.StoreID())
-		if err := tc.rng.AddCmd(proto.InternalHeartbeatTxn, hbArgs, hbReply, true); err != nil {
+		if err := tc.rng.AddCmd(hbArgs, hbReply, true); err != nil {
 			t.Error(err)
 		}
 		if hbReply.Txn.Status != expStatus || hbReply.Txn.LastHeartbeat != nil {
@@ -1056,7 +1382,7 @@ func TestEndTransactionAfterHeartbeat(t *testing.T) {
 		// Start out with a heartbeat to the transaction.
 		hbArgs, hbReply := heartbeatArgs(txn, 1, tc.store.StoreID())
 		hbArgs.Timestamp = txn.Timestamp
-		if err := tc.rng.AddCmd(proto.InternalHeartbeatTxn, hbArgs, hbReply, true); err != nil {
+		if err := tc.rng.AddCmd(hbArgs, hbReply, true); err != nil {
 			t.Error(err)
 		}
 		if hbReply.Txn.Status != proto.PENDING || hbReply.Txn.LastHeartbeat == nil {
@@ -1065,7 +1391,7 @@ func TestEndTransactionAfterHeartbeat(t *testing.T) {
 
 		args, reply := endTxnArgs(txn, commit, 1, tc.store.StoreID())
 		args.Timestamp = txn.Timestamp
-		if err := tc.rng.AddCmd(proto.EndTransaction, args, reply, true); err != nil {
+		if err := tc.rng.AddCmd(args, reply, true); err != nil {
 			t.Error(err)
 		}
 		expStatus := proto.COMMITTED
@@ -1109,7 +1435,7 @@ func TestEndTransactionWithPushedTimestamp(t *testing.T) {
 		args, reply := endTxnArgs(txn, test.commit, 1, tc.store.StoreID())
 		tc.manualClock.Set(1)
 		args.Timestamp = tc.clock.Now()
-		err := tc.rng.AddCmd(proto.EndTransaction, args, reply, true)
+		err := tc.rng.AddCmd(args, reply, true)
 		if test.expErr {
 			if err == nil {
 				t.Errorf("expected error")
@@ -1146,7 +1472,7 @@ func TestEndTransactionWithIncrementedEpoch(t *testing.T) {
 	// Start out with a heartbeat to the transaction.
 	hbArgs, hbReply := heartbeatArgs(txn, 1, tc.store.StoreID())
 	hbArgs.Timestamp = txn.Timestamp
-	if err := tc.rng.AddCmd(proto.InternalHeartbeatTxn, hbArgs, hbReply, true); err != nil {
+	if err := tc.rng.AddCmd(hbArgs, hbReply, true); err != nil {
 		t.Error(err)
 	}
 
@@ -1155,7 +1481,7 @@ func TestEndTransactionWithIncrementedEpoch(t *testing.T) {
 	args.Timestamp = txn.Timestamp
 	args.Txn.Epoch = txn.Epoch + 1
 	args.Txn.Priority = txn.Priority + 1
-	if err := tc.rng.AddCmd(proto.EndTransaction, args, reply, true); err != nil {
+	if err := tc.rng.AddCmd(args, reply, true); err != nil {
 		t.Error(err)
 	}
 	if reply.Txn.Status != proto.COMMITTED {
@@ -1212,7 +1538,7 @@ func TestEndTransactionWithErrors(t *testing.T) {
 		txn.Key = test.key
 		args, reply := endTxnArgs(txn, true, 1, tc.store.StoreID())
 		args.Timestamp = txn.Timestamp
-		verifyErrorMatches(tc.rng.AddCmd(proto.EndTransaction, args, reply, true), test.expErrRegexp, t)
+		verifyErrorMatches(tc.rng.AddCmd(args, reply, true), test.expErrRegexp, t)
 	}
 }
 
@@ -1228,7 +1554,7 @@ func TestInternalPushTxnBadKey(t *testing.T) {
 
 	args, reply := pushTxnArgs(pusher, pushee, true, 1, tc.store.StoreID())
 	args.Key = pusher.Key
-	verifyErrorMatches(tc.rng.AddCmd(proto.InternalPushTxn, args, reply, true), ".*should match pushee.*", t)
+	verifyErrorMatches(tc.rng.AddCmd(args, reply, true), ".*should match pushee.*", t)
 }
 
 // TestInternalPushTxnAlreadyCommittedOrAborted verifies success
@@ -1249,13 +1575,13 @@ func TestInternalPushTxnAlreadyCommittedOrAborted(t *testing.T) {
 		// End the pushee's transaction.
 		etArgs, etReply := endTxnArgs(pushee, status == proto.COMMITTED, 1, tc.store.StoreID())
 		etArgs.Timestamp = pushee.Timestamp
-		if err := tc.rng.AddCmd(proto.EndTransaction, etArgs, etReply, true); err != nil {
+		if err := tc.rng.AddCmd(etArgs, etReply, true); err != nil {
 			t.Fatal(err)
 		}
 
 		// Now try to push what's already committed or aborted.
 		args, reply := pushTxnArgs(pusher, pushee, true, 1, tc.store.StoreID())
-		if err := tc.rng.AddCmd(proto.InternalPushTxn, args, reply, true); err != nil {
+		if err := tc.rng.AddCmd(args, reply, true); err != nil {
 			t.Fatal(err)
 		}
 		if reply.PusheeTxn.Status != status {
@@ -1306,7 +1632,7 @@ func TestInternalPushTxnUpgradeExistingTxn(t *testing.T) {
 		pushee.Timestamp = test.startTS
 		hbArgs, hbReply := heartbeatArgs(pushee, 1, tc.store.StoreID())
 		hbArgs.Timestamp = pushee.Timestamp
-		if err := tc.rng.AddCmd(proto.InternalHeartbeatTxn, hbArgs, hbReply, true); err != nil {
+		if err := tc.rng.AddCmd(hbArgs, hbReply, true); err != nil {
 			t.Fatal(err)
 		}
 
@@ -1314,7 +1640,7 @@ func TestInternalPushTxnUpgradeExistingTxn(t *testing.T) {
 		pushee.Epoch = test.epoch
 		pushee.Timestamp = test.ts
 		args, reply := pushTxnArgs(pusher, pushee, true, 1, tc.store.StoreID())
-		if err := tc.rng.AddCmd(proto.InternalPushTxn, args, reply, true); err != nil {
+		if err := tc.rng.AddCmd(args, reply, true); err != nil {
 			t.Fatal(err)
 		}
 		expTxn := gogoproto.Clone(pushee).(*proto.Transaction)
@@ -1364,7 +1690,7 @@ func TestInternalPushTxnHeartbeatTimeout(t *testing.T) {
 		if test.heartbeat != nil {
 			hbArgs, hbReply := heartbeatArgs(pushee, 1, tc.store.StoreID())
 			hbArgs.Timestamp = *test.heartbeat
-			if err := tc.rng.AddCmd(proto.InternalHeartbeatTxn, hbArgs, hbReply, true); err != nil {
+			if err := tc.rng.AddCmd(hbArgs, hbReply, true); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -1372,7 +1698,8 @@ func TestInternalPushTxnHeartbeatTimeout(t *testing.T) {
 		// Now, attempt to push the transaction with clock set to "currentTime".
 		tc.manualClock.Set(test.currentTime)
 		args, reply := pushTxnArgs(pusher, pushee, true, 1, tc.store.StoreID())
-		err := tc.rng.AddCmd(proto.InternalPushTxn, args, reply, true)
+		args.Timestamp = tc.clock.Now()
+		err := tc.rng.AddCmd(args, reply, true)
 		if test.expSuccess != (err == nil) {
 			t.Errorf("expected success on trial %d? %t; got err %s", i, test.expSuccess, err)
 		}
@@ -1415,14 +1742,14 @@ func TestInternalPushTxnOldEpoch(t *testing.T) {
 		pushee.Epoch = test.curEpoch
 		hbArgs, hbReply := heartbeatArgs(pushee, 1, tc.store.StoreID())
 		hbArgs.Timestamp = pushee.Timestamp
-		if err := tc.rng.AddCmd(proto.InternalHeartbeatTxn, hbArgs, hbReply, true); err != nil {
+		if err := tc.rng.AddCmd(hbArgs, hbReply, true); err != nil {
 			t.Fatal(err)
 		}
 
 		// Now, attempt to push the transaction with intent epoch set appropriately.
 		pushee.Epoch = test.intentEpoch
 		args, reply := pushTxnArgs(pusher, pushee, true, 1, tc.store.StoreID())
-		err := tc.rng.AddCmd(proto.InternalPushTxn, args, reply, true)
+		err := tc.rng.AddCmd(args, reply, true)
 		if test.expSuccess != (err == nil) {
 			t.Errorf("expected success on trial %d? %t; got err %s", i, test.expSuccess, err)
 		}
@@ -1482,7 +1809,7 @@ func TestInternalPushTxnPriorities(t *testing.T) {
 
 		// Now, attempt to push the transaction with intent epoch set appropriately.
 		args, reply := pushTxnArgs(pusher, pushee, test.abort, 1, tc.store.StoreID())
-		err := tc.rng.AddCmd(proto.InternalPushTxn, args, reply, true)
+		err := tc.rng.AddCmd(args, reply, true)
 		if test.expSuccess != (err == nil) {
 			t.Errorf("expected success on trial %d? %t; got err %s", i, test.expSuccess, err)
 		}
@@ -1513,7 +1840,7 @@ func TestInternalPushTxnPushTimestamp(t *testing.T) {
 
 	// Now, push the transaction with args.Abort=false.
 	args, reply := pushTxnArgs(pusher, pushee, false /* abort */, 1, tc.store.StoreID())
-	if err := tc.rng.AddCmd(proto.InternalPushTxn, args, reply, true); err != nil {
+	if err := tc.rng.AddCmd(args, reply, true); err != nil {
 		t.Errorf("unexpected error on push: %s", err)
 	}
 	expTS := pusher.Timestamp
@@ -1545,7 +1872,7 @@ func TestInternalPushTxnPushTimestampAlreadyPushed(t *testing.T) {
 
 	// Now, push the transaction with args.Abort=false.
 	args, reply := pushTxnArgs(pusher, pushee, false /* abort */, 1, tc.store.StoreID())
-	if err := tc.rng.AddCmd(proto.InternalPushTxn, args, reply, true); err != nil {
+	if err := tc.rng.AddCmd(args, reply, true); err != nil {
 		t.Errorf("unexpected error on push: %s", err)
 	}
 	if !reply.PusheeTxn.Timestamp.Equal(pushee.Timestamp) {
@@ -1556,8 +1883,8 @@ func TestInternalPushTxnPushTimestampAlreadyPushed(t *testing.T) {
 	}
 }
 
-func verifyRangeStats(eng engine.Engine, raftID int64, expMS engine.MVCCStats, t *testing.T) {
-	var ms engine.MVCCStats
+func verifyRangeStats(eng engine.Engine, raftID int64, expMS proto.MVCCStats, t *testing.T) {
+	var ms proto.MVCCStats
 	if err := engine.MVCCGetRangeStats(eng, raftID, &ms); err != nil {
 		t.Fatal(err)
 	}
@@ -1590,20 +1917,20 @@ func TestRangeStatsComputation(t *testing.T) {
 	// Put a value.
 	pArgs, pReply := putArgs([]byte("a"), []byte("value1"), 1, tc.store.StoreID())
 	pArgs.Timestamp = tc.clock.Now()
-	if err := tc.rng.AddCmd(proto.Put, pArgs, pReply, true); err != nil {
+	if err := tc.rng.AddCmd(pArgs, pReply, true); err != nil {
 		t.Fatal(err)
 	}
-	expMS := engine.MVCCStats{LiveBytes: 39, KeyBytes: 15, ValBytes: 24, IntentBytes: 0, LiveCount: 1, KeyCount: 1, ValCount: 1, IntentCount: 0}
+	expMS := proto.MVCCStats{LiveBytes: 39, KeyBytes: 15, ValBytes: 24, IntentBytes: 0, LiveCount: 1, KeyCount: 1, ValCount: 1, IntentCount: 0}
 	verifyRangeStats(tc.engine, tc.rng.Desc().RaftID, expMS, t)
 
 	// Put a 2nd value transactionally.
 	pArgs, pReply = putArgs([]byte("b"), []byte("value2"), 1, tc.store.StoreID())
 	pArgs.Timestamp = tc.clock.Now()
 	pArgs.Txn = &proto.Transaction{ID: []byte("txn1"), Timestamp: pArgs.Timestamp}
-	if err := tc.rng.AddCmd(proto.Put, pArgs, pReply, true); err != nil {
+	if err := tc.rng.AddCmd(pArgs, pReply, true); err != nil {
 		t.Fatal(err)
 	}
-	expMS = engine.MVCCStats{LiveBytes: 118, KeyBytes: 30, ValBytes: 88, IntentBytes: 24, LiveCount: 2, KeyCount: 2, ValCount: 2, IntentCount: 1}
+	expMS = proto.MVCCStats{LiveBytes: 118, KeyBytes: 30, ValBytes: 88, IntentBytes: 24, LiveCount: 2, KeyCount: 2, ValCount: 2, IntentCount: 1}
 	verifyRangeStats(tc.engine, tc.rng.Desc().RaftID, expMS, t)
 
 	// Resolve the 2nd value.
@@ -1618,19 +1945,19 @@ func TestRangeStatsComputation(t *testing.T) {
 	}
 	rArgs.Txn.Status = proto.COMMITTED
 	rReply := &proto.InternalResolveIntentResponse{}
-	if err := tc.rng.AddCmd(proto.InternalResolveIntent, rArgs, rReply, true); err != nil {
+	if err := tc.rng.AddCmd(rArgs, rReply, true); err != nil {
 		t.Fatal(err)
 	}
-	expMS = engine.MVCCStats{LiveBytes: 78, KeyBytes: 30, ValBytes: 48, IntentBytes: 0, LiveCount: 2, KeyCount: 2, ValCount: 2, IntentCount: 0}
+	expMS = proto.MVCCStats{LiveBytes: 78, KeyBytes: 30, ValBytes: 48, IntentBytes: 0, LiveCount: 2, KeyCount: 2, ValCount: 2, IntentCount: 0}
 	verifyRangeStats(tc.engine, tc.rng.Desc().RaftID, expMS, t)
 
 	// Delete the 1st value.
 	dArgs, dReply := deleteArgs([]byte("a"), 1, tc.store.StoreID())
 	dArgs.Timestamp = tc.clock.Now()
-	if err := tc.rng.AddCmd(proto.Delete, dArgs, dReply, true); err != nil {
+	if err := tc.rng.AddCmd(dArgs, dReply, true); err != nil {
 		t.Fatal(err)
 	}
-	expMS = engine.MVCCStats{LiveBytes: 39, KeyBytes: 42, ValBytes: 50, IntentBytes: 0, LiveCount: 1, KeyCount: 2, ValCount: 3, IntentCount: 0}
+	expMS = proto.MVCCStats{LiveBytes: 39, KeyBytes: 42, ValBytes: 50, IntentBytes: 0, LiveCount: 1, KeyCount: 2, ValCount: 3, IntentCount: 0}
 	verifyRangeStats(tc.engine, tc.rng.Desc().RaftID, expMS, t)
 }
 
@@ -1651,13 +1978,13 @@ func TestInternalMerge(t *testing.T) {
 	for _, str := range stringArgs {
 		mergeArgs, resp := internalMergeArgs(key, proto.Value{Bytes: []byte(str)}, 1,
 			tc.store.StoreID())
-		if err := tc.rng.AddCmd(proto.InternalMerge, mergeArgs, resp, true); err != nil {
+		if err := tc.rng.AddCmd(mergeArgs, resp, true); err != nil {
 			t.Fatalf("unexpected error from InternalMerge: %s", err.Error())
 		}
 	}
 
 	getArgs, resp := getArgs(key, 1, tc.store.StoreID())
-	if err := tc.rng.AddCmd(proto.Get, getArgs, resp, true); err != nil {
+	if err := tc.rng.AddCmd(getArgs, resp, true); err != nil {
 		t.Fatalf("unexpected error from Get: %s", err.Error())
 	}
 	if resp.Value == nil {
@@ -1681,7 +2008,7 @@ func TestInternalTruncateLog(t *testing.T) {
 	var indexes []uint64
 	for i := 0; i < 10; i++ {
 		args, resp := incrementArgs([]byte("a"), int64(i), 1, tc.store.StoreID())
-		if err := tc.rng.AddCmd(proto.Increment, args, resp, true); err != nil {
+		if err := tc.rng.AddCmd(args, resp, true); err != nil {
 			t.Fatal(err)
 		}
 		idx, err := tc.rng.LastIndex()
@@ -1693,7 +2020,7 @@ func TestInternalTruncateLog(t *testing.T) {
 
 	// Discard the first half of the log
 	truncateArgs, truncateResp := internalTruncateLogArgs(indexes[5], 1, tc.store.StoreID())
-	if err := tc.rng.AddCmd(proto.InternalTruncateLog, truncateArgs, truncateResp, true); err != nil {
+	if err := tc.rng.AddCmd(truncateArgs, truncateResp, true); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1742,7 +2069,9 @@ func TestRaftStorage(t *testing.T) {
 	var tc testContext
 	storagetest.RunTests(t,
 		func(t *testing.T) storagetest.WriteableStorage {
-			tc = testContext{}
+			// Make sure the Raft group doesn't auto-start, or the elections
+			// will write HardState which confuses storagetest.
+			tc = testContext{dormantRaft: true}
 			tc.Start(t)
 			return tc.rng
 		},
@@ -1762,7 +2091,7 @@ func TestConditionFailedError(t *testing.T) {
 	key := []byte("k")
 	value := []byte("quack")
 	pArgs, pReply := putArgs(key, value, 1, tc.store.StoreID())
-	if err := tc.rng.executeCmd(0, proto.Put, pArgs, pReply); err != nil {
+	if err := tc.rng.AddCmd(pArgs, pReply, true); err != nil {
 		t.Fatal(err)
 	}
 	args := &proto.ConditionalPutRequest{
@@ -1780,7 +2109,7 @@ func TestConditionFailedError(t *testing.T) {
 		},
 	}
 	reply := &proto.ConditionalPutResponse{}
-	err := tc.rng.executeCmd(0, proto.ConditionalPut, args, reply)
+	err := tc.rng.AddCmd(args, reply, true)
 	if cErr, ok := err.(*proto.ConditionFailedError); err == nil || !ok {
 		t.Fatalf("expected ConditionFailedError, got %T with content %+v",
 			err, err)
@@ -1829,7 +2158,7 @@ func TestAppliedIndex(t *testing.T) {
 	var sum int64
 	for i := int64(1); i <= 10; i++ {
 		args, reply := incrementArgs([]byte("a"), i, 1, tc.store.StoreID())
-		err := tc.rng.AddCmd(proto.Increment, args, reply, true)
+		err := tc.rng.AddCmd(args, reply, true)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1845,4 +2174,89 @@ func TestAppliedIndex(t *testing.T) {
 		}
 		appliedIndex = newAppliedIndex
 	}
+}
+
+// TestChangeReplicasDuplicateError tests that a replica change that would
+// use a NodeID twice in the replica configuration fails.
+func TestChangeReplicasDuplicateError(t *testing.T) {
+	defer leaktest.AfterTest(t)
+	tc := testContext{}
+	tc.Start(t)
+	defer tc.Stop()
+
+	if err := tc.rng.ChangeReplicas(proto.ADD_REPLICA, proto.Replica{
+		NodeID:  tc.store.Ident.NodeID,
+		StoreID: 9999,
+	}); err == nil || !strings.Contains(err.Error(),
+		"already present") {
+		t.Fatalf("must not be able to add second replica to same node (err=%s)",
+			err)
+	}
+}
+
+// benchmarkEvents is designed to determine the impact of sending events on the
+// performance of write commands. This benchmark can be run with or without
+// events, and with or without a consumer reading the events.
+func benchmarkEvents(b *testing.B, sendEvents, consumeEvents bool) {
+	defer leaktest.AfterTest(b)
+	tc := testContext{}
+
+	if sendEvents {
+		tc.feed = &util.Feed{}
+	}
+	eventC := 0
+	consumeStopper := util.NewStopper()
+	if consumeEvents {
+		sub := tc.feed.Subscribe()
+		consumeStopper.RunWorker(func() {
+			for _ = range sub.Events() {
+				eventC++
+			}
+		})
+	}
+
+	tc.Start(b)
+	defer tc.Stop()
+
+	args, reply := incrementArgs([]byte("a"), 1, 1, tc.store.StoreID())
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		err := tc.rng.AddCmd(args, reply, true)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+	b.StopTimer()
+
+	if consumeEvents {
+		// Close feed and wait for consumer to finish.
+		tc.feed.Close()
+		consumeStopper.Stop()
+		<-consumeStopper.IsStopped()
+
+		// The test expects exactly b.N update events to be sent on the feed.
+		// The '+5' is a constant number of non-update events sent when the
+		// store is first started.
+		if a, e := eventC, b.N+5; a != e {
+			b.Errorf("Unexpected number of events received %d, expected %d", a, e)
+		}
+	}
+}
+
+// BenchmarkWriteCmdNoEvents benchmarks write commands on a store that does not
+// publish events.
+func BenchmarkWriteCmdNoEvents(b *testing.B) {
+	benchmarkEvents(b, false, false)
+}
+
+// BenchmarkWriteCmdNoEvents benchmarks write commands on a store that publishes
+// events. There are no subscribers to the events, but they are still produced.
+func BenchmarkWriteCmdWithEvents(b *testing.B) {
+	benchmarkEvents(b, true, false)
+}
+
+// BenchmarkWriteConsumeEvents benchmarks write commands on a store that publishes
+// events. There is a single subscriber reading the events.
+func BenchmarkWriteCmdWithEventsAndConsumer(b *testing.B) {
+	benchmarkEvents(b, true, true)
 }

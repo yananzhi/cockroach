@@ -28,6 +28,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/proto"
 	"github.com/cockroachdb/cockroach/storage/engine"
+	"github.com/cockroachdb/cockroach/testutils"
 	"github.com/cockroachdb/cockroach/util"
 	"github.com/cockroachdb/cockroach/util/log"
 )
@@ -38,14 +39,14 @@ import (
 // Cockroach KV client address is set to the address of the test server.
 func startAdminServer() (string, *util.Stopper) {
 	stopper := util.NewStopper()
-	db, err := BootstrapCluster("cluster-1", engine.NewInMem(proto.Attributes{}, 1<<20), stopper)
+	db, err := BootstrapCluster("cluster-1", []engine.Engine{engine.NewInMem(proto.Attributes{}, 1<<20)}, stopper)
 	if err != nil {
 		log.Fatal(err)
 	}
 	admin := newAdminServer(db, stopper)
 	mux := http.NewServeMux()
 	admin.registerHandlers(mux)
-	httpServer := httptest.NewServer(mux)
+	httpServer := httptest.NewTLSServer(mux)
 	stopper.AddCloser(httpServer)
 
 	if strings.HasPrefix(httpServer.URL, "http://") {
@@ -59,7 +60,11 @@ func startAdminServer() (string, *util.Stopper) {
 // getText fetches the HTTP response body as text in the form of a
 // byte slice from the specified URL.
 func getText(url string) ([]byte, error) {
-	resp, err := http.Get(url)
+	client, err := testutils.NewTestHTTPClient()
+	if err != nil {
+		return nil, err
+	}
+	resp, err := client.Get(url)
 	if err != nil {
 		return nil, err
 	}

@@ -25,6 +25,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cockroachdb/cockroach/base"
 	"github.com/cockroachdb/cockroach/gossip"
 	"github.com/cockroachdb/cockroach/proto"
 	"github.com/cockroachdb/cockroach/storage/engine"
@@ -38,17 +39,20 @@ const (
 	defaultMaxOffset      = 250 * time.Millisecond
 	defaultGossipInterval = 2 * time.Second
 	defaultCacheSize      = 1 << 30 // GB
+	// defaultScanInterval is the default value for the scan interval.
+	// command line flag.
+	defaultScanInterval = 10 * time.Minute
 )
 
 // Context holds parameters needed to setup a server.
 // Calling "server/cli".InitFlags(ctx *Context) will initialize Context using
 // command flags. Keep in sync with "server/cli/flags.go".
 type Context struct {
+	// Embed the base context.
+	base.Context
+
 	// Addr is the host:port to bind for HTTP/RPC traffic.
 	Addr string
-
-	// Certs specifies a directory containing RSA key and x509 certs.
-	Certs string
 
 	// Stores is specified to enable durable key-value storage.
 	// Memory-backed key value stores may be optionally specified
@@ -84,6 +88,10 @@ type Context struct {
 	// node clocks have necessarily passed it.
 	Linearizable bool
 
+	// Enables the experimental RPC server for use by the experimental
+	// RPC client.
+	ExperimentalRPCServer bool
+
 	// CacheSize is the amount of memory in bytes to use for caching data.
 	// The value is split evenly between the stores if there are more than one.
 	CacheSize int64
@@ -98,58 +106,71 @@ type Context struct {
 
 	// GossipBootstrapResolvers is a list of gossip resolvers used
 	// to find bootstrap nodes for connecting to the gossip network.
-	GossipBootstrapResolvers []*gossip.Resolver
+	GossipBootstrapResolvers []gossip.Resolver
+
+	// ScanInterval determines a duration during which each range should be
+	// visited approximately once by the range scanner.
+	ScanInterval time.Duration
 }
 
 // NewContext returns a Context with default values.
 func NewContext() *Context {
-	return &Context{
+	ctx := &Context{
 		Addr:           defaultAddr,
 		MaxOffset:      defaultMaxOffset,
 		GossipInterval: defaultGossipInterval,
 		CacheSize:      defaultCacheSize,
+		ScanInterval:   defaultScanInterval,
 	}
+	// Initializes base context defaults.
+	ctx.InitDefaults()
+	return ctx
 }
 
 // Init interprets the stores parameter to initialize a slice of
 // engine.Engine objects, parses node attributes, and initializes
 // the gossip bootstrap resolvers.
-func (ctx *Context) Init() error {
-	var err error
-	storesRE := regexp.MustCompile(`([^=]+)=([^,]+)(,|$)`)
-	// Error if regexp doesn't match.
-	storeSpecs := storesRE.FindAllStringSubmatch(ctx.Stores, -1)
-	if storeSpecs == nil || len(storeSpecs) == 0 {
-		return fmt.Errorf("invalid or empty engines specification %q, "+
-			"did you specify -stores?", ctx.Stores)
+func (ctx *Context) Init(command string) error {
+	if command == "init" || command == "start" || command == "exterminate" {
+		// Get the stores on both start and init.
+		storesRE := regexp.MustCompile(`([^=]+)=([^,]+)(,|$)`)
+		// Error if regexp doesn't match.
+		storeSpecs := storesRE.FindAllStringSubmatch(ctx.Stores, -1)
+		if storeSpecs == nil || len(storeSpecs) == 0 {
+			return fmt.Errorf("invalid or empty engines specification %q, "+
+				"did you specify -stores?", ctx.Stores)
+		}
+
+		ctx.Engines = nil
+		for _, store := range storeSpecs {
+			if len(store) != 4 {
+				return util.Errorf("unable to parse attributes and path from store %q", store[0])
+			}
+			// There are two matches for each store specification: the colon-separated
+			// list of attributes and the path.
+			engine, err := ctx.initEngine(store[1], store[2])
+			if err != nil {
+				return util.Errorf("unable to init engine for store %q: %s", store[0], err)
+			}
+			ctx.Engines = append(ctx.Engines, engine)
+		}
+		log.Infof("initialized %d storage engine(s)", len(ctx.Engines))
 	}
 
-	ctx.Engines = nil
-	for _, store := range storeSpecs {
-		if len(store) != 4 {
-			return util.Errorf("unable to parse attributes and path from store %q", store[0])
-		}
-		// There are two matches for each store specification: the colon-separated
-		// list of attributes and the path.
-		engine, err := ctx.initEngine(store[1], store[2])
+	if command == "start" {
+		// Initialize attributes.
+		ctx.NodeAttributes = parseAttributes(ctx.Attrs)
+
+		// Get the gossip bootstrap resolvers.
+		resolvers, err := ctx.parseGossipBootstrapResolvers()
 		if err != nil {
-			return util.Errorf("unable to init engine for store %q: %s", store[0], err)
+			return err
 		}
-		ctx.Engines = append(ctx.Engines, engine)
+		if len(resolvers) == 0 {
+			return errors.New("no gossip addresses found, did you specify -gossip?")
+		}
+		ctx.GossipBootstrapResolvers = resolvers
 	}
-	log.Infof("initialized %d storage engine(s)", len(ctx.Engines))
-
-	ctx.NodeAttributes = parseAttributes(ctx.Attrs)
-
-	resolvers, err := ctx.parseGossipBootstrapResolvers()
-	if err != nil {
-		return err
-	}
-	if len(resolvers) == 0 {
-		return errors.New("no gossip addresses found, did you specify -gossip?")
-	}
-	ctx.GossipBootstrapResolvers = resolvers
-
 	return nil
 }
 
@@ -172,8 +193,8 @@ func (ctx *Context) initEngine(attrsStr, path string) (engine.Engine, error) {
 
 // parseGossipBootstrapResolvers parses a comma-separated list of
 // gossip bootstrap resolvers.
-func (ctx *Context) parseGossipBootstrapResolvers() ([]*gossip.Resolver, error) {
-	var bootstrapResolvers []*gossip.Resolver
+func (ctx *Context) parseGossipBootstrapResolvers() ([]gossip.Resolver, error) {
+	var bootstrapResolvers []gossip.Resolver
 	addresses := strings.Split(ctx.GossipBootstrap, ",")
 	for _, address := range addresses {
 		if len(address) == 0 {

@@ -6,14 +6,16 @@ cmd github.com/jteeuwen/go-bindata/go-bindata
 cmd github.com/kisielk/errcheck
 cmd github.com/robfig/glock
 cmd golang.org/x/tools/cmd/goimports
+cmd golang.org/x/tools/cmd/stringer
 bitbucket.org/tebeka/go2xunit 77968f802fb3
 code.google.com/p/go-commander df033a4b379cd723ef7408b881c1e092cd943831
 code.google.com/p/go-uuid 35bc42037350
 code.google.com/p/snappy-go 8850bd446ad6
 github.com/agtorre/gocolorize f42b554bf7f006936130c9bb4f971afd2d87f671
 github.com/biogo/store cb1ae010c5c75b7ce4f5c5d0ef92defcafdfdce4
+github.com/cockroachdb/c-lz4 6e71f140a365017bbe0904710007f8725fd3f809
 github.com/cockroachdb/c-protobuf 9e8dac59ca2a3fc82cd0665ad32b1a36f3df40b8
-github.com/cockroachdb/c-rocksdb 72de025ca13dd4ab2dce63e8e19c6a59b8388ffd
+github.com/cockroachdb/c-rocksdb e120ce0fb32f86b94188928743270ea11ff016b3
 github.com/cockroachdb/c-snappy af73b00e85e6f0e3c1fcc51f73f1d036df1e99ff
 github.com/coreos/etcd e5f2f401450b56947e231336f9e8350059428036
 github.com/elazarl/go-bindata-assetfs bea323321994103859d60197d229f1a94699dde3
@@ -24,5 +26,6 @@ github.com/jteeuwen/go-bindata 7362d4b6b2ce6a7d3c28b523a6e40629f4d81116
 github.com/kisielk/errcheck eb516cb958915b69ad14384890b4d37bd910c9f3
 github.com/kisielk/gotool d678387370a2eb9b5b0a33218bc8c9d8de15b6be
 github.com/robfig/glock 78c45da050a4d993d12ad07e8ddb10a4891ac701
+golang.org/x/net 169f42267807fe93f4a4b0150583e410aefafe4e
 golang.org/x/tools 4744be3abc70249546ce31c32fa9b5a5e96b5ad1
 gopkg.in/yaml.v1 9f9df34309c04878acc86042b16630b0f696e1de

@@ -24,7 +24,6 @@ import (
 
 	"github.com/cockroachdb/cockroach/proto"
 	"github.com/cockroachdb/cockroach/util"
-	"github.com/cockroachdb/cockroach/util/hlc"
 )
 
 func TestInvalidAddrLength(t *testing.T) {
@@ -42,7 +41,7 @@ func TestInvalidAddrLength(t *testing.T) {
 // TestSendToOneClient verifies that Send correctly sends a request
 // to one server using the heartbeat RPC.
 func TestSendToOneClient(t *testing.T) {
-	rpcContext := createNewTestRPCContext(t)
+	rpcContext := NewTestContext(t)
 	s := createAndStartNewServer(rpcContext, t)
 	defer s.Close()
 
@@ -64,7 +63,7 @@ func TestSendToOneClient(t *testing.T) {
 // TestSendToMultipleClients verifies that Send correctly sends
 // multiple requests to multiple server using the heartbeat RPC.
 func TestSendToMultipleClients(t *testing.T) {
-	rpcContext := createNewTestRPCContext(t)
+	rpcContext := NewTestContext(t)
 	numServers := 4
 	var addrs []net.Addr
 	for i := 0; i < numServers; i++ {
@@ -93,7 +92,7 @@ func TestSendToMultipleClients(t *testing.T) {
 // TestRetryableError verifies that Send returns a retryable error
 // when it hits an RPC error.
 func TestRetryableError(t *testing.T) {
-	rpcContext := createNewTestRPCContext(t)
+	rpcContext := NewTestContext(t)
 	s := createAndStartNewServer(rpcContext, t)
 
 	// Wait until the server becomes ready and shut down the server.
@@ -126,14 +125,14 @@ func TestRetryableError(t *testing.T) {
 // TestUnretryableError verifies that Send returns an unretryable
 // error when it hits a critical error.
 func TestUnretryableError(t *testing.T) {
-	rpcContext := createNewTestRPCContext(t)
+	rpcContext := NewTestContext(t)
 	s := createAndStartNewServer(rpcContext, t)
 
 	opts := Options{
 		N:               1,
 		Ordering:        OrderStable,
 		SendNextTimeout: 1 * time.Second,
-		Timeout:         1 * time.Second,
+		Timeout:         5 * time.Second,
 	}
 	getArgs := func(addr net.Addr) interface{} {
 		return &proto.PingRequest{}
@@ -156,10 +155,60 @@ func TestUnretryableError(t *testing.T) {
 	}
 }
 
+// TestClientNotReady verifies that Send gets an RPC error when a client
+// does not become ready.
+func TestClientNotReady(t *testing.T) {
+	rpcContext := NewTestContext(t)
+	addr := util.CreateTestAddr("tcp")
+
+	opts := Options{
+		N:               1,
+		Ordering:        OrderStable,
+		SendNextTimeout: 1 * time.Nanosecond,
+		Timeout:         1 * time.Nanosecond,
+	}
+	// Send RPC to an address where no server is running.
+	_, err := sendPing(opts, []net.Addr{addr}, rpcContext)
+	if err == nil {
+		t.Fatalf("Unexpected success")
+	}
+	retryErr, ok := err.(util.Retryable)
+	if !ok {
+		t.Fatalf("Unexpected error type: %v", err)
+	}
+	if !retryErr.CanRetry() {
+		t.Errorf("Expected retryable error: %v", retryErr)
+	}
+
+	// Send the RPC again with no timeout.
+	opts.SendNextTimeout = 0 * time.Nanosecond
+	opts.Timeout = 0 * time.Nanosecond
+	c := make(chan interface{})
+	go func() {
+		sendPing(opts, []net.Addr{addr}, rpcContext)
+		close(c)
+	}()
+	select {
+	case <-c:
+		t.Fatalf("Unexpected end of rpc call")
+	case <-time.After(1 * time.Millisecond):
+	}
+
+	// Grab the client for our invalid address and close it. This will
+	// cause the blocked ping RPC to finish.
+	client := NewClient(addr, nil, rpcContext)
+	client.Close()
+	select {
+	case <-c:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatalf("RPC call failed to return")
+	}
+}
+
 // TestComplexScenarios verifies various complex success/failure scenarios by
 // mocking sendOne.
 func TestComplexScenarios(t *testing.T) {
-	rpcContext := createNewTestRPCContext(t)
+	rpcContext := NewTestContext(t)
 
 	testCases := []struct {
 		numServers               int
@@ -260,15 +309,6 @@ func TestComplexScenarios(t *testing.T) {
 			t.Errorf("%d: Unexpected error: %v", i, retryErr)
 		}
 	}
-}
-
-// createNewTestRPCContext creates an RPCContext used for test.
-func createNewTestRPCContext(t *testing.T) *Context {
-	tlsConfig, err := LoadTestTLSConfig()
-	if err != nil {
-		t.Fatal(err)
-	}
-	return NewContext(hlc.NewClock(hlc.UnixNano), tlsConfig)
 }
 
 // createAndStartNewServer creates and starts a new server with a test address.

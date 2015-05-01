@@ -21,12 +21,10 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/cockroachdb/cockroach/client"
 	"github.com/cockroachdb/cockroach/multiraft"
 	"github.com/cockroachdb/cockroach/proto"
 	"github.com/cockroachdb/cockroach/storage"
 	"github.com/cockroachdb/cockroach/storage/engine"
-	"github.com/cockroachdb/cockroach/util"
 	"github.com/cockroachdb/cockroach/util/hlc"
 )
 
@@ -103,50 +101,11 @@ func TestLocalSenderGetStore(t *testing.T) {
 	}
 }
 
-func splitTestRange(store *storage.Store, key, splitKey proto.Key, t *testing.T) *storage.Range {
-	rng := store.LookupRange(key, key)
-	if rng == nil {
-		t.Fatalf("couldn't lookup range for key %q", key)
-	}
-	desc, err := store.NewRangeDescriptor(splitKey, rng.Desc().EndKey, rng.Desc().Replicas)
-	if err != nil {
-		t.Fatal(err)
-	}
-	newRng, err := storage.NewRange(desc, store)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := store.SplitRange(rng, newRng); err != nil {
-		t.Fatal(err)
-	}
-	return newRng
-}
-
 func TestLocalSenderLookupReplica(t *testing.T) {
+	ctx := storage.TestStoreContext
 	manualClock := hlc.NewManualClock(0)
-	clock := hlc.NewClock(manualClock.UnixNano)
-	eng := engine.NewInMem(proto.Attributes{}, 1<<20)
+	ctx.Clock = hlc.NewClock(manualClock.UnixNano)
 	ls := NewLocalSender()
-	stopper := util.NewStopper()
-	defer stopper.Stop()
-	db := client.NewKV(nil, NewTxnCoordSender(ls, clock, false, stopper))
-	transport := multiraft.NewLocalRPCTransport()
-	defer transport.Close()
-	store := storage.NewStore(clock, eng, db, nil, transport, storage.TestStoreConfig)
-	if err := store.Bootstrap(proto.StoreIdent{NodeID: 1, StoreID: 1}, stopper); err != nil {
-		t.Fatal(err)
-	}
-	ls.AddStore(store)
-	if err := store.BootstrapRange(); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.Start(stopper); err != nil {
-		t.Fatal(err)
-	}
-	rng := splitTestRange(store, engine.KeyMin, proto.Key("a"), t)
-	if err := store.RemoveRange(rng); err != nil {
-		t.Fatal(err)
-	}
 
 	// Create two new stores with ranges we care about.
 	var e [2]engine.Engine
@@ -160,20 +119,16 @@ func TestLocalSenderLookupReplica(t *testing.T) {
 	}
 	for i, rng := range ranges {
 		e[i] = engine.NewInMem(proto.Attributes{}, 1<<20)
-		transport := multiraft.NewLocalRPCTransport()
-		defer transport.Close()
-		s[i] = storage.NewStore(clock, e[i], db, nil, transport, storage.TestStoreConfig)
+		ctx.Transport = multiraft.NewLocalRPCTransport()
+		defer ctx.Transport.Close()
+		s[i] = storage.NewStore(ctx, e[i], &proto.NodeDescriptor{NodeID: 1})
 		s[i].Ident.StoreID = rng.storeID
-		if err := s[i].Bootstrap(proto.StoreIdent{NodeID: 1, StoreID: rng.storeID}, stopper); err != nil {
-			t.Fatal(err)
-		}
-		if err := s[i].Start(stopper); err != nil {
-			t.Fatal(err)
-		}
 
-		desc, err := store.NewRangeDescriptor(rng.start, rng.end, []proto.Replica{{StoreID: rng.storeID}})
-		if err != nil {
-			t.Fatal(err)
+		desc := &proto.RangeDescriptor{
+			RaftID:   int64(i),
+			StartKey: rng.start,
+			EndKey:   rng.end,
+			Replicas: []proto.Replica{{StoreID: rng.storeID}},
 		}
 		newRng, err := storage.NewRange(desc, s[i])
 		if err != nil {

@@ -24,6 +24,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/client"
 	"github.com/cockroachdb/cockroach/proto"
+	"github.com/cockroachdb/cockroach/rpc"
 	"github.com/cockroachdb/cockroach/util"
 )
 
@@ -45,6 +46,43 @@ func verifyRequest(args proto.Request) error {
 		}
 	}
 	return nil
+}
+
+// createArgsAndReply returns allocated request and response pairs
+// according to the specified method. Note that createArgsAndReply
+// only knows about public methods and explicitly returns nil for
+// internal methods. Do not change this behavior without also fixing
+// DBServer.ServeHTTP.
+func createArgsAndReply(method string) (proto.Request, proto.Response) {
+	if m, ok := proto.AllMethods[method]; ok {
+		switch m {
+		case proto.Contains:
+			return &proto.ContainsRequest{}, &proto.ContainsResponse{}
+		case proto.Get:
+			return &proto.GetRequest{}, &proto.GetResponse{}
+		case proto.Put:
+			return &proto.PutRequest{}, &proto.PutResponse{}
+		case proto.ConditionalPut:
+			return &proto.ConditionalPutRequest{}, &proto.ConditionalPutResponse{}
+		case proto.Increment:
+			return &proto.IncrementRequest{}, &proto.IncrementResponse{}
+		case proto.Delete:
+			return &proto.DeleteRequest{}, &proto.DeleteResponse{}
+		case proto.DeleteRange:
+			return &proto.DeleteRangeRequest{}, &proto.DeleteRangeResponse{}
+		case proto.Scan:
+			return &proto.ScanRequest{}, &proto.ScanResponse{}
+		case proto.EndTransaction:
+			return &proto.EndTransactionRequest{}, &proto.EndTransactionResponse{}
+		case proto.Batch:
+			return &proto.BatchRequest{}, &proto.BatchResponse{}
+		case proto.AdminSplit:
+			return &proto.AdminSplitRequest{}, &proto.AdminSplitResponse{}
+		case proto.AdminMerge:
+			return &proto.AdminMergeRequest{}, &proto.AdminMergeResponse{}
+		}
+	}
+	return nil, nil
 }
 
 // A DBServer provides an HTTP server endpoint serving the key-value API.
@@ -73,7 +111,8 @@ func (s *DBServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	method = strings.TrimPrefix(method, DBPrefix)
-	if !proto.IsPublic(method) {
+	args, reply := createArgsAndReply(method)
+	if args == nil {
 		http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 		return
 	}
@@ -83,11 +122,6 @@ func (s *DBServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	args, reply, err := proto.CreateArgsAndReply(method)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	if err := util.UnmarshalRequest(r, reqBody, args, allowedEncodings); err != nil {
@@ -102,12 +136,7 @@ func (s *DBServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Create a call and invoke through sender.
-	call := &client.Call{
-		Method: method,
-		Args:   args,
-		Reply:  reply,
-	}
-	s.sender.Send(call)
+	s.sender.Send(client.Call{Args: args, Reply: reply})
 
 	// Marshal the response.
 	body, contentType, err := util.MarshalResponse(r, reply, allowedEncodings)
@@ -117,4 +146,79 @@ func (s *DBServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", contentType)
 	w.Write(body)
+}
+
+// RegisterRPC registers the RPC endpoints.
+func (s *DBServer) RegisterRPC(rpcServer *rpc.Server) error {
+	return rpcServer.RegisterName("Server", (*rpcDBServer)(s))
+}
+
+// rpcDBServer is used to provide a separate method namespace for RPC
+// registration.
+type rpcDBServer DBServer
+
+// executeCmd creates a client.Call struct and sends if via our local sender.
+func (s *rpcDBServer) executeCmd(args proto.Request, reply proto.Response) error {
+	s.sender.Send(client.Call{Args: args, Reply: reply})
+	return nil
+}
+
+// Contains .
+func (s *rpcDBServer) Contains(args *proto.ContainsRequest, reply *proto.ContainsResponse) error {
+	return s.executeCmd(args, reply)
+}
+
+// Get .
+func (s *rpcDBServer) Get(args *proto.GetRequest, reply *proto.GetResponse) error {
+	return s.executeCmd(args, reply)
+}
+
+// Put .
+func (s *rpcDBServer) Put(args *proto.PutRequest, reply *proto.PutResponse) error {
+	return s.executeCmd(args, reply)
+}
+
+// ConditionalPut .
+func (s *rpcDBServer) ConditionalPut(args *proto.ConditionalPutRequest, reply *proto.ConditionalPutResponse) error {
+	return s.executeCmd(args, reply)
+}
+
+// Increment .
+func (s *rpcDBServer) Increment(args *proto.IncrementRequest, reply *proto.IncrementResponse) error {
+	return s.executeCmd(args, reply)
+}
+
+// Delete .
+func (s *rpcDBServer) Delete(args *proto.DeleteRequest, reply *proto.DeleteResponse) error {
+	return s.executeCmd(args, reply)
+}
+
+// DeleteRange .
+func (s *rpcDBServer) DeleteRange(args *proto.DeleteRangeRequest, reply *proto.DeleteRangeResponse) error {
+	return s.executeCmd(args, reply)
+}
+
+// Scan .
+func (s *rpcDBServer) Scan(args *proto.ScanRequest, reply *proto.ScanResponse) error {
+	return s.executeCmd(args, reply)
+}
+
+// EndTransaction .
+func (s *rpcDBServer) EndTransaction(args *proto.EndTransactionRequest, reply *proto.EndTransactionResponse) error {
+	return s.executeCmd(args, reply)
+}
+
+// Batch .
+func (s *rpcDBServer) Batch(args *proto.BatchRequest, reply *proto.BatchResponse) error {
+	return s.executeCmd(args, reply)
+}
+
+// AdminSplit .
+func (s *rpcDBServer) AdminSplit(args *proto.AdminSplitRequest, reply *proto.AdminSplitResponse) error {
+	return s.executeCmd(args, reply)
+}
+
+// AdminMerge .
+func (s *rpcDBServer) AdminMerge(args *proto.AdminMergeRequest, reply *proto.AdminMergeResponse) error {
+	return s.executeCmd(args, reply)
 }

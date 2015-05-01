@@ -21,7 +21,6 @@ package engine
 import (
 	"bytes"
 	"fmt"
-	"strconv"
 
 	"github.com/cockroachdb/cockroach/proto"
 	"github.com/cockroachdb/cockroach/util/encoding"
@@ -53,7 +52,13 @@ func StoreStatKey(stat proto.Key) proto.Key {
 // StoreStatusKey returns the key for accessing the store status for the
 // specified store ID.
 func StoreStatusKey(storeID int32) proto.Key {
-	return MakeKey(KeyStatusStorePrefix, proto.Key(strconv.FormatInt(int64(storeID), 10)))
+	return MakeKey(KeyStatusStorePrefix, encoding.EncodeUvarint(nil, uint64(storeID)))
+}
+
+// NodeStatusKey returns the key for accessing the node status for the
+// specified node ID.
+func NodeStatusKey(nodeID int32) proto.Key {
+	return MakeKey(KeyStatusNodePrefix, encoding.EncodeUvarint(nil, uint64(nodeID)))
 }
 
 // MakeRangeIDKey creates a range-local key based on the range's
@@ -68,8 +73,7 @@ func MakeRangeIDKey(raftID int64, suffix, detail proto.Key) proto.Key {
 
 // RaftLogKey returns a system-local key for a Raft log entry.
 func RaftLogKey(raftID int64, logIndex uint64) proto.Key {
-	// The log is stored "backwards" so we can easily find the highest index stored.
-	return MakeRangeIDKey(raftID, KeyLocalRaftLogSuffix, encoding.EncodeUint64Decreasing(nil, logIndex))
+	return MakeRangeIDKey(raftID, KeyLocalRaftLogSuffix, encoding.EncodeUint64(nil, logIndex))
 }
 
 // RaftLogPrefix returns the system-local prefix shared by all entries in a Raft log.
@@ -101,6 +105,16 @@ func RaftTruncatedStateKey(raftID int64) proto.Key {
 // RaftAppliedIndexKey returns a system-local key for a raft applied index.
 func RaftAppliedIndexKey(raftID int64) proto.Key {
 	return MakeRangeIDKey(raftID, KeyLocalRaftAppliedIndexSuffix, proto.Key{})
+}
+
+// RaftLeaderLeaseKey returns a system-local key for a raft leader lease.
+func RaftLeaderLeaseKey(raftID int64) proto.Key {
+	return MakeRangeIDKey(raftID, KeyLocalRaftLeaderLeaseSuffix, proto.Key{})
+}
+
+// RaftLastIndexKey returns a system-local key for a raft last index.
+func RaftLastIndexKey(raftID int64) proto.Key {
+	return MakeRangeIDKey(raftID, KeyLocalRaftLastIndexSuffix, proto.Key{})
 }
 
 // RangeStatKey returns the key for accessing the named stat
@@ -364,14 +378,23 @@ var (
 	// NOTE: KeyLocalRangeIDPrefix must be kept in sync with the value
 	// in storage/engine/db.cc.
 	KeyLocalRangeIDPrefix = MakeKey(KeyLocalPrefix, proto.Key("i"))
-	// KeyLocalRaftLogSuffix is the suffix for the raft log.
-	KeyLocalRaftLogSuffix = proto.Key("rftl")
+	// KeyLocalResponseCacheSuffix is the suffix for keys storing
+	// command responses used to guarantee idempotency (see ResponseCache).
+	// NOTE: if this value changes, it must be updated in C++
+	// (storage/engine/db.cc).
+	KeyLocalResponseCacheSuffix = proto.Key("res-")
+	// KeyLocalRaftLeaderLeaseSuffix is the suffix for the raft leader lease.
+	KeyLocalRaftLeaderLeaseSuffix = proto.Key("rfll")
 	// KeyLocalRaftHardStateSuffix is the Suffix for the raft HardState.
 	KeyLocalRaftHardStateSuffix = proto.Key("rfth")
-	// KeyLocalRaftTruncatedStateSuffix is the suffix for the RaftTruncatedState.
-	KeyLocalRaftTruncatedStateSuffix = proto.Key("rftt")
 	// KeyLocalRaftAppliedIndexSuffix is the suffix for the raft applied index.
 	KeyLocalRaftAppliedIndexSuffix = proto.Key("rfta")
+	// KeyLocalRaftLogSuffix is the suffix for the raft log.
+	KeyLocalRaftLogSuffix = proto.Key("rftl")
+	// KeyLocalRaftTruncatedStateSuffix is the suffix for the RaftTruncatedState.
+	KeyLocalRaftTruncatedStateSuffix = proto.Key("rftt")
+	// KeyLocalRaftLastIndexSuffix is the suffix for raft's last index.
+	KeyLocalRaftLastIndexSuffix = proto.Key("rfti")
 	// KeyLocalRangeGCMetadataSuffix is the suffix for a range's GC metadata.
 	KeyLocalRangeGCMetadataSuffix = proto.Key("rgcm")
 	// KeyLocalRangeLastVerificationTimestampSuffix is the suffix for a range's
@@ -379,12 +402,6 @@ var (
 	KeyLocalRangeLastVerificationTimestampSuffix = proto.Key("rlvt")
 	// KeyLocalRangeStatSuffix is the suffix for range statistics.
 	KeyLocalRangeStatSuffix = proto.Key("rst-")
-	// KeyLocalResponseCacheSuffix is the suffix for keys storing
-	// command responses used to guarantee idempotency (see
-	// ResponseCache).
-	// NOTE: if this value changes, it must be updated in C++
-	// (storage/engine/db.cc).
-	KeyLocalResponseCacheSuffix = proto.Key("res-")
 
 	// KeyLocalRangeKeyPrefix is the prefix identifying per-range data
 	// indexed by range key (either start key, or some key in the
@@ -446,9 +463,8 @@ var (
 	KeyRaftIDGenerator = MakeKey(KeySystemPrefix, proto.Key("raft-idgen"))
 	// KeySchemaPrefix specifies key prefixes for schema definitions.
 	KeySchemaPrefix = MakeKey(KeySystemPrefix, proto.Key("schema"))
-	// KeyStoreIDGeneratorPrefix specifies key prefixes for sequence
-	// generators, one per node, for store IDs.
-	KeyStoreIDGeneratorPrefix = MakeKey(KeySystemPrefix, proto.Key("store-idgen-"))
+	// KeyStoreIDGenerator is the global store ID generator sequence.
+	KeyStoreIDGenerator = MakeKey(KeySystemPrefix, proto.Key("store-idgen"))
 	// KeyRangeTreeRoot specifies the root range in the range tree.
 	KeyRangeTreeRoot = MakeKey(KeySystemPrefix, proto.Key("range-tree-root"))
 
@@ -456,4 +472,6 @@ var (
 	KeyStatusPrefix = MakeKey(KeySystemPrefix, proto.Key("status-"))
 	// KeyStatusStorePrefix stores all status info for stores.
 	KeyStatusStorePrefix = MakeKey(KeyStatusPrefix, proto.Key("store-"))
+	// KeyStatusNodePrefix stores all status info for nodes.
+	KeyStatusNodePrefix = MakeKey(KeyStatusPrefix, proto.Key("node-"))
 )

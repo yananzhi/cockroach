@@ -82,13 +82,9 @@ func TestManualHeartbeat(t *testing.T) {
 }
 
 func TestUpdateOffsetOnHeartbeat(t *testing.T) {
-	tlsConfig, err := LoadTestTLSConfig()
-	if err != nil {
-		t.Fatal(err)
-	}
+	sContext := NewTestContext(t)
 	serverAddr := util.CreateTestAddr("tcp")
 	// Start heartbeat.
-	sContext := NewContext(hlc.NewClock(hlc.UnixNano), tlsConfig)
 	s := NewServer(serverAddr, sContext)
 	if err := s.Start(); err != nil {
 		t.Fatal(err)

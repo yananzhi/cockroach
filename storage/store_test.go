@@ -23,7 +23,6 @@ import (
 	"bytes"
 	"fmt"
 	"math"
-	"reflect"
 	"sort"
 	"testing"
 	"time"
@@ -34,6 +33,7 @@ import (
 	"github.com/cockroachdb/cockroach/multiraft"
 	"github.com/cockroachdb/cockroach/proto"
 	"github.com/cockroachdb/cockroach/rpc"
+	"github.com/cockroachdb/cockroach/security"
 	"github.com/cockroachdb/cockroach/storage/engine"
 	"github.com/cockroachdb/cockroach/util"
 	"github.com/cockroachdb/cockroach/util/hlc"
@@ -52,7 +52,7 @@ var testIdent = proto.StoreIdent{
 // of attempts so we don't get stuck behind indefinite backoff/retry
 // loops.
 func setTestRetryOptions(s *Store) {
-	s.RetryOpts = util.RetryOptions{
+	s.ctx.RangeRetryOptions = util.RetryOptions{
 		Backoff:     1 * time.Millisecond,
 		MaxBackoff:  2 * time.Millisecond,
 		Constant:    2,
@@ -71,9 +71,10 @@ type testSender struct {
 // tests in this package. Batches and transactions are not
 // supported. Since kv/ depends on storage/, we can't get access to a
 // coordinator sender from here.
-func (db *testSender) Send(call *client.Call) {
-	if call.Method == proto.EndTransaction || call.Method == proto.Batch {
-		call.Reply.Header().SetGoError(util.Errorf("%s method not supported", call.Method))
+func (db *testSender) Send(call client.Call) {
+	switch call.Args.(type) {
+	case *proto.EndTransactionRequest, *proto.BatchRequest, *proto.InternalBatchRequest:
+		call.Reply.Header().SetGoError(util.Errorf("%s method not supported", call.Method()))
 		return
 	}
 	// Lookup range and direct request.
@@ -81,7 +82,7 @@ func (db *testSender) Send(call *client.Call) {
 	if rng := db.store.LookupRange(header.Key, header.EndKey); rng != nil {
 		header.RaftID = rng.Desc().RaftID
 		header.Replica = *rng.GetReplica()
-		db.store.ExecuteCmd(call.Method, call.Args, call.Reply)
+		db.store.ExecuteCmd(call.Args, call.Reply)
 	} else {
 		call.Reply.Header().SetGoError(proto.NewRangeKeyMismatchError(header.Key, header.EndKey, nil))
 	}
@@ -92,18 +93,20 @@ func (db *testSender) Send(call *client.Call) {
 // and a stopper. The caller is responsible for stopping the stopper
 // upon completion.
 func createTestStore(t *testing.T) (*Store, *hlc.ManualClock, *util.Stopper) {
-	rpcContext := rpc.NewContext(hlc.NewClock(hlc.UnixNano), rpc.LoadInsecureTLSConfig())
 	stopper := util.NewStopper()
-	g := gossip.New(rpcContext, gossip.TestInterval, gossip.TestBootstrap)
+	rpcContext := rpc.NewContext(hlc.NewClock(hlc.UnixNano), security.LoadInsecureTLSConfig(), stopper)
+	ctx := TestStoreContext
+	ctx.Gossip = gossip.New(rpcContext, gossip.TestInterval, gossip.TestBootstrap)
 	manual := hlc.NewManualClock(0)
-	clock := hlc.NewClock(manual.UnixNano)
+	ctx.Clock = hlc.NewClock(manual.UnixNano)
 	eng := engine.NewInMem(proto.Attributes{}, 10<<20)
-	// TODO(bdarnell): arrange to have the transport closed.
-	store := NewStore(clock, eng, nil, g, multiraft.NewLocalRPCTransport(), TestStoreConfig)
+	ctx.Transport = multiraft.NewLocalRPCTransport()
+	stopper.AddCloser(ctx.Transport)
+	store := NewStore(ctx, eng, &proto.NodeDescriptor{NodeID: 1})
 	if err := store.Bootstrap(proto.StoreIdent{NodeID: 1, StoreID: 1}, stopper); err != nil {
 		t.Fatal(err)
 	}
-	store.db = client.NewKV(nil, &testSender{store: store})
+	store.ctx.DB = client.NewKV(nil, &testSender{store: store})
 	if err := store.BootstrapRange(); err != nil {
 		t.Fatal(err)
 	}
@@ -116,14 +119,15 @@ func createTestStore(t *testing.T) (*Store, *hlc.ManualClock, *util.Stopper) {
 // TestStoreInitAndBootstrap verifies store initialization and bootstrap.
 func TestStoreInitAndBootstrap(t *testing.T) {
 	defer leaktest.AfterTest(t)
+	ctx := TestStoreContext
 	manual := hlc.NewManualClock(0)
-	clock := hlc.NewClock(manual.UnixNano)
+	ctx.Clock = hlc.NewClock(manual.UnixNano)
 	eng := engine.NewInMem(proto.Attributes{}, 1<<20)
-	transport := multiraft.NewLocalRPCTransport()
+	ctx.Transport = multiraft.NewLocalRPCTransport()
 	stopper := util.NewStopper()
-	stopper.AddCloser(transport)
+	stopper.AddCloser(ctx.Transport)
 	defer stopper.Stop()
-	store := NewStore(clock, eng, nil, nil, transport, TestStoreConfig)
+	store := NewStore(ctx, eng, &proto.NodeDescriptor{NodeID: 1})
 
 	// Can't start as haven't bootstrapped.
 	if err := store.Start(stopper); err == nil {
@@ -146,39 +150,13 @@ func TestStoreInitAndBootstrap(t *testing.T) {
 	}
 
 	// Now, attempt to initialize a store with a now-bootstrapped range.
-	store = NewStore(clock, eng, nil, nil, transport, TestStoreConfig)
+	store = NewStore(ctx, eng, &proto.NodeDescriptor{NodeID: 1})
 	if err := store.Start(stopper); err != nil {
 		t.Errorf("failure initializing bootstrapped store: %s", err)
 	}
 	// 1st range should be available.
 	if _, err := store.GetRange(1); err != nil {
 		t.Errorf("failure fetching 1st range: %s", err)
-	}
-
-	// Make sure the store status exists and is correct.
-	expectedStoreStatus := &proto.StoreStatus{
-		StoreID:   1,
-		NodeID:    1,
-		RaftIDs:   []int64{1},
-		UpdatedAt: 0,
-		StartedAt: 0,
-		UsedBytes: 0,
-		MaxBytes:  0,
-	}
-	storeStatusKey := engine.StoreStatusKey(int32(store.Ident.StoreID))
-	gArgs, gReply := getArgs(storeStatusKey, 1, store.StoreID())
-	if err := store.ExecuteCmd(proto.Get, gArgs, gReply); err != nil {
-		t.Fatalf("failure getting store status: %s", err)
-	}
-	if gReply.Value == nil {
-		t.Errorf("could not find store status at: %s", storeStatusKey)
-	}
-	storeStatus := &proto.StoreStatus{}
-	if err := gogoproto.Unmarshal(gReply.Value.GetBytes(), storeStatus); err != nil {
-		t.Errorf("could not unmarshal store status: %+v", gReply)
-	}
-	if !reflect.DeepEqual(storeStatus, expectedStoreStatus) {
-		t.Errorf("actual store status is not as expected\nexpected: %+v\nactual: %v\n", expectedStoreStatus, storeStatus)
 	}
 }
 
@@ -192,13 +170,14 @@ func TestBootstrapOfNonEmptyStore(t *testing.T) {
 	if err := eng.Put(proto.EncodedKey("foo"), []byte("bar")); err != nil {
 		t.Errorf("failure putting key foo into engine: %s", err)
 	}
+	ctx := TestStoreContext
 	manual := hlc.NewManualClock(0)
-	clock := hlc.NewClock(manual.UnixNano)
-	transport := multiraft.NewLocalRPCTransport()
+	ctx.Clock = hlc.NewClock(manual.UnixNano)
+	ctx.Transport = multiraft.NewLocalRPCTransport()
 	stopper := util.NewStopper()
-	stopper.AddCloser(transport)
+	stopper.AddCloser(ctx.Transport)
 	defer stopper.Stop()
-	store := NewStore(clock, eng, nil, nil, transport, TestStoreConfig)
+	store := NewStore(ctx, eng, &proto.NodeDescriptor{NodeID: 1})
 
 	// Can't init as haven't bootstrapped.
 	if err := store.Start(stopper); err == nil {
@@ -270,6 +249,10 @@ func TestStoreAddRemoveRanges(t *testing.T) {
 	}
 	if _, ok := err.(*rangeAlreadyExists); !ok {
 		t.Fatalf("expected rangeAlreadyExists error; got %s", err)
+	}
+	// Try to remove range 1 again.
+	if err := store.RemoveRange(rng1); err == nil {
+		t.Fatal("expected error re-removing same range")
 	}
 	// Try to add a range with previously-used (but now removed) ID.
 	rng2Dup := createRange(store, 1, proto.Key("a"), proto.Key("b"))
@@ -393,11 +376,11 @@ func TestStoreExecuteCmd(t *testing.T) {
 	gArgs, gReply := getArgs([]byte("a"), 1, store.StoreID())
 
 	// Try a successful get request.
-	if err := store.ExecuteCmd(proto.Get, gArgs, gReply); err != nil {
+	if err := store.ExecuteCmd(gArgs, gReply); err != nil {
 		t.Fatal(err)
 	}
 	pArgs, pReply := putArgs([]byte("a"), []byte("aaa"), 1, store.StoreID())
-	if err := store.ExecuteCmd(proto.Put, pArgs, pReply); err != nil {
+	if err := store.ExecuteCmd(pArgs, pReply); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -412,30 +395,30 @@ func TestStoreVerifyKeys(t *testing.T) {
 
 	// Start with a too-long key on a get.
 	gArgs, gReply := getArgs(tooLongKey, 1, store.StoreID())
-	if err := store.ExecuteCmd(proto.Get, gArgs, gReply); err == nil {
+	if err := store.ExecuteCmd(gArgs, gReply); err == nil {
 		t.Fatal("expected error for key too long")
 	}
 	// Try a start key == KeyMax.
 	gArgs.Key = engine.KeyMax
-	if err := store.ExecuteCmd(proto.Get, gArgs, gReply); err == nil {
+	if err := store.ExecuteCmd(gArgs, gReply); err == nil {
 		t.Fatal("expected error for start key == KeyMax")
 	}
 	// Try a scan with too-long EndKey.
 	sArgs, sReply := scanArgs(engine.KeyMin, tooLongKey, 1, store.StoreID())
-	if err := store.ExecuteCmd(proto.Scan, sArgs, sReply); err == nil {
+	if err := store.ExecuteCmd(sArgs, sReply); err == nil {
 		t.Fatal("expected error for end key too long")
 	}
 	// Try a scan with end key < start key.
 	sArgs.Key = []byte("b")
 	sArgs.EndKey = []byte("a")
-	if err := store.ExecuteCmd(proto.Scan, sArgs, sReply); err == nil {
+	if err := store.ExecuteCmd(sArgs, sReply); err == nil {
 		t.Fatal("expected error for end key < start")
 	}
 	// Try a put to meta2 key which would otherwise exceed maximum key
 	// length, but is accepted because of the meta prefix.
 	meta2KeyMax := engine.MakeKey(engine.KeyMeta2Prefix, engine.KeyMax)
 	pArgs, pReply := putArgs(meta2KeyMax, []byte("value"), 1, store.StoreID())
-	if err := store.ExecuteCmd(proto.Put, pArgs, pReply); err != nil {
+	if err := store.ExecuteCmd(pArgs, pReply); err != nil {
 		t.Fatalf("unexpected error on put to meta2 value: %s", err)
 	}
 	// Try to put a range descriptor record for a start key which is
@@ -443,7 +426,7 @@ func TestStoreVerifyKeys(t *testing.T) {
 	key := append([]byte{}, engine.KeyMax...)
 	key[len(key)-1] = 0x01
 	pArgs, pReply = putArgs(engine.RangeDescriptorKey(key), []byte("value"), 1, store.StoreID())
-	if err := store.ExecuteCmd(proto.Put, pArgs, pReply); err != nil {
+	if err := store.ExecuteCmd(pArgs, pReply); err != nil {
 		t.Fatalf("unexpected error on put to range descriptor for KeyMax value: %s", err)
 	}
 	// Try a put to txn record for a meta2 key (note that this doesn't
@@ -451,7 +434,7 @@ func TestStoreVerifyKeys(t *testing.T) {
 	// but are instead manipulated only through txn methods).
 	pArgs, pReply = putArgs(engine.TransactionKey(meta2KeyMax, []byte(uuid.New())),
 		[]byte("value"), 1, store.StoreID())
-	if err := store.ExecuteCmd(proto.Put, pArgs, pReply); err != nil {
+	if err := store.ExecuteCmd(pArgs, pReply); err != nil {
 		t.Fatalf("unexpected error on put to txn meta2 value: %s", err)
 	}
 }
@@ -462,13 +445,13 @@ func TestStoreExecuteCmdUpdateTime(t *testing.T) {
 	store, _, stopper := createTestStore(t)
 	defer stopper.Stop()
 	args, reply := getArgs([]byte("a"), 1, store.StoreID())
-	args.Timestamp = store.clock.Now()
+	args.Timestamp = store.ctx.Clock.Now()
 	args.Timestamp.WallTime += (100 * time.Millisecond).Nanoseconds()
-	err := store.ExecuteCmd(proto.Get, args, reply)
+	err := store.ExecuteCmd(args, reply)
 	if err != nil {
 		t.Fatal(err)
 	}
-	ts := store.clock.Timestamp()
+	ts := store.ctx.Clock.Timestamp()
 	if ts.WallTime != args.Timestamp.WallTime || ts.Logical <= args.Timestamp.Logical {
 		t.Errorf("expected store clock to advance to %s; got %s", args.Timestamp, ts)
 	}
@@ -484,15 +467,15 @@ func TestStoreExecuteCmdWithZeroTime(t *testing.T) {
 
 	// Set clock to time 1.
 	mc.Set(1)
-	err := store.ExecuteCmd(proto.Get, args, reply)
+	err := store.ExecuteCmd(args, reply)
 	if err != nil {
 		t.Fatal(err)
 	}
 	// The Logical time will increase over the course of the command
 	// execution so we can only rely on comparing the WallTime.
-	if reply.Timestamp.WallTime != store.clock.Timestamp().WallTime {
+	if reply.Timestamp.WallTime != store.ctx.Clock.Now().WallTime {
 		t.Errorf("expected reply to have store clock time %s; got %s",
-			store.clock.Timestamp(), reply.Timestamp)
+			store.ctx.Clock.Now(), reply.Timestamp)
 	}
 }
 
@@ -509,11 +492,11 @@ func TestStoreExecuteCmdWithClockOffset(t *testing.T) {
 	mc.Set(1)
 	// Set clock max offset to 250ms.
 	maxOffset := 250 * time.Millisecond
-	store.clock.SetMaxOffset(maxOffset)
+	store.ctx.Clock.SetMaxOffset(maxOffset)
 	// Set args timestamp to exceed max offset.
-	args.Timestamp = store.clock.Now()
+	args.Timestamp = store.ctx.Clock.Now()
 	args.Timestamp.WallTime += maxOffset.Nanoseconds() + 1
-	err := store.ExecuteCmd(proto.Get, args, reply)
+	err := store.ExecuteCmd(args, reply)
 	if err == nil {
 		t.Error("expected max offset clock error")
 	}
@@ -525,12 +508,17 @@ func TestStoreExecuteCmdBadRange(t *testing.T) {
 	store, _, stopper := createTestStore(t)
 	defer stopper.Stop()
 	args, reply := getArgs([]byte("0"), 2, store.StoreID()) // no range ID 2
-	err := store.ExecuteCmd(proto.Get, args, reply)
+	err := store.ExecuteCmd(args, reply)
 	if err == nil {
 		t.Error("expected invalid range")
 	}
 }
 
+// splitTestRange splits a range. This does *not* fully emulate a real split
+// and should not be used in new tests. Tests that need splits should live in
+// client_split_test.go and use AdminSplit instead of this function.
+// See #702
+// TODO(bdarnell): convert tests that use this function to use AdminSplit instead.
 func splitTestRange(store *Store, key, splitKey proto.Key, t *testing.T) *Range {
 	rng := store.LookupRange(key, key)
 	if rng == nil {
@@ -556,16 +544,21 @@ func TestStoreExecuteCmdOutOfRange(t *testing.T) {
 	defer leaktest.AfterTest(t)
 	store, _, stopper := createTestStore(t)
 	defer stopper.Stop()
-	// Split the range and then remove the second half to clear up some space.
-	rng := splitTestRange(store, engine.KeyMin, proto.Key("a"), t)
-	if err := store.RemoveRange(rng); err != nil {
-		t.Fatal(err)
-	}
-	// Range is from KeyMin to "a", so reading "a" should fail because
-	// it's just outside the range boundary.
-	args, reply := getArgs([]byte("a"), 1, store.StoreID())
-	err := store.ExecuteCmd(proto.Get, args, reply)
+
+	rng2 := splitTestRange(store, engine.KeyMin, proto.Key("b"), t)
+
+	// Range 1 is from KeyMin to "b", so reading "b" from range 1 should
+	// fail because it's just after the range boundary.
+	args, reply := getArgs([]byte("b"), 1, store.StoreID())
+	err := store.ExecuteCmd(args, reply)
 	if err == nil {
+		t.Error("expected key to be out of range")
+	}
+
+	// Range 2 is from "b" to KeyMax, so reading "a" from range 2 should
+	// fail because it's before the start of the range.
+	args, reply = getArgs([]byte("a"), rng2.Desc().RaftID, store.StoreID())
+	if err := store.ExecuteCmd(args, reply); err == nil {
 		t.Error("expected key to be out of range")
 	}
 }
@@ -663,8 +656,8 @@ func TestStoreSetRangesMaxBytes(t *testing.T) {
 	}
 	key := engine.MakeKey(engine.KeyConfigZonePrefix, proto.Key("a"))
 	pArgs, pReply := putArgs(key, data, 1, store.StoreID())
-	pArgs.Timestamp = store.clock.Now()
-	if err := store.ExecuteCmd(proto.Put, pArgs, pReply); err != nil {
+	pArgs.Timestamp = store.ctx.Clock.Now()
+	if err := store.ExecuteCmd(pArgs, pReply); err != nil {
 		t.Fatal(err)
 	}
 
@@ -691,8 +684,8 @@ func TestStoreResolveWriteIntent(t *testing.T) {
 
 	for i, resolvable := range []bool{true, false} {
 		key := proto.Key(fmt.Sprintf("key-%d", i))
-		pusher := newTransaction("test", key, 1, proto.SERIALIZABLE, store.clock)
-		pushee := newTransaction("test", key, 1, proto.SERIALIZABLE, store.clock)
+		pusher := newTransaction("test", key, 1, proto.SERIALIZABLE, store.ctx.Clock)
+		pushee := newTransaction("test", key, 1, proto.SERIALIZABLE, store.ctx.Clock)
 		if resolvable {
 			pushee.Priority = 1
 			pusher.Priority = 2 // Pusher will win.
@@ -703,16 +696,16 @@ func TestStoreResolveWriteIntent(t *testing.T) {
 
 		// First lay down intent using the pushee's txn.
 		pArgs, pReply := putArgs(key, []byte("value"), 1, store.StoreID())
-		pArgs.Timestamp = store.clock.Now()
+		pArgs.Timestamp = store.ctx.Clock.Now()
 		pArgs.Txn = pushee
-		if err := store.ExecuteCmd(proto.Put, pArgs, pReply); err != nil {
+		if err := store.ExecuteCmd(pArgs, pReply); err != nil {
 			t.Fatal(err)
 		}
 
 		// Now, try a put using the pusher's txn.
-		pArgs.Timestamp = store.clock.Now()
+		pArgs.Timestamp = store.ctx.Clock.Now()
 		pArgs.Txn = pusher
-		err := store.ExecuteCmd(proto.Put, pArgs, pReply)
+		err := store.ExecuteCmd(pArgs, pReply)
 		if resolvable {
 			if err != nil {
 				t.Errorf("expected intent resolved; got unexpected error: %s", err)
@@ -735,7 +728,7 @@ func TestStoreResolveWriteIntent(t *testing.T) {
 				t.Errorf("expected txn to match pushee %q; got %s", pushee.ID, rErr)
 			}
 			// Trying again should fail again.
-			if err = store.ExecuteCmd(proto.Put, pArgs, pReply); err == nil {
+			if err = store.ExecuteCmd(pArgs, pReply); err == nil {
 				t.Errorf("expected another error on latent write intent but succeeded")
 			}
 		}
@@ -750,24 +743,24 @@ func TestStoreResolveWriteIntentRollback(t *testing.T) {
 	defer stopper.Stop()
 
 	key := proto.Key("a")
-	pusher := newTransaction("test", key, 1, proto.SERIALIZABLE, store.clock)
-	pushee := newTransaction("test", key, 1, proto.SERIALIZABLE, store.clock)
+	pusher := newTransaction("test", key, 1, proto.SERIALIZABLE, store.ctx.Clock)
+	pushee := newTransaction("test", key, 1, proto.SERIALIZABLE, store.ctx.Clock)
 	pushee.Priority = 1
 	pusher.Priority = 2 // Pusher will win.
 
 	// First lay down intent using the pushee's txn.
 	args, reply := incrementArgs(key, 1, 1, store.StoreID())
-	args.Timestamp = store.clock.Now()
+	args.Timestamp = store.ctx.Clock.Now()
 	args.Txn = pushee
-	if err := store.ExecuteCmd(proto.Increment, args, reply); err != nil {
+	if err := store.ExecuteCmd(args, reply); err != nil {
 		t.Fatal(err)
 	}
 
 	// Now, try a put using the pusher's txn.
-	args.Timestamp = store.clock.Now()
+	args.Timestamp = store.ctx.Clock.Now()
 	args.Txn = pusher
 	args.Increment = 2
-	if err := store.ExecuteCmd(proto.Increment, args, reply); err != nil {
+	if err := store.ExecuteCmd(args, reply); err != nil {
 		t.Errorf("expected increment to succeed: %s", err)
 	}
 	if reply.NewValue != 2 {
@@ -799,8 +792,8 @@ func TestStoreResolveWriteIntentPushOnRead(t *testing.T) {
 	}
 	for i, test := range testCases {
 		key := proto.Key(fmt.Sprintf("key-%d", i))
-		pusher := newTransaction("test", key, 1, proto.SERIALIZABLE, store.clock)
-		pushee := newTransaction("test", key, 1, test.pusheeIso, store.clock)
+		pusher := newTransaction("test", key, 1, proto.SERIALIZABLE, store.ctx.Clock)
+		pushee := newTransaction("test", key, 1, test.pusheeIso, store.ctx.Clock)
 		if test.resolvable {
 			pushee.Priority = 1
 			pusher.Priority = 2 // Pusher will win.
@@ -811,24 +804,24 @@ func TestStoreResolveWriteIntentPushOnRead(t *testing.T) {
 
 		// First, write original value.
 		args, reply := putArgs(key, []byte("value1"), 1, store.StoreID())
-		args.Timestamp = store.clock.Now()
-		if err := store.ExecuteCmd(proto.Put, args, reply); err != nil {
+		args.Timestamp = store.ctx.Clock.Now()
+		if err := store.ExecuteCmd(args, reply); err != nil {
 			t.Fatal(err)
 		}
 
 		// Second, lay down intent using the pushee's txn.
-		args.Timestamp = store.clock.Now()
+		args.Timestamp = store.ctx.Clock.Now()
 		args.Txn = pushee
 		args.Value.Bytes = []byte("value2")
-		if err := store.ExecuteCmd(proto.Put, args, reply); err != nil {
+		if err := store.ExecuteCmd(args, reply); err != nil {
 			t.Fatal(err)
 		}
 
 		// Now, try to read value using the pusher's txn.
 		gArgs, gReply := getArgs(key, 1, store.StoreID())
-		gArgs.Timestamp = store.clock.Now()
+		gArgs.Timestamp = store.ctx.Clock.Now()
 		gArgs.Txn = pusher
-		err := store.ExecuteCmd(proto.Get, gArgs, gReply)
+		err := store.ExecuteCmd(gArgs, gReply)
 		if test.resolvable {
 			if err != nil {
 				t.Errorf("%d: expected read to succeed: %s", i, err)
@@ -842,7 +835,7 @@ func TestStoreResolveWriteIntentPushOnRead(t *testing.T) {
 			// verify commit fails with TransactionRetryError.
 			etArgs, etReply := endTxnArgs(pushee, true, 1, store.StoreID())
 			etArgs.Timestamp = pushee.Timestamp
-			err := store.ExecuteCmd(proto.EndTransaction, etArgs, etReply)
+			err := store.ExecuteCmd(etArgs, etReply)
 
 			expTimestamp := gArgs.Timestamp
 			expTimestamp.Logical++
@@ -889,31 +882,31 @@ func TestStoreResolveWriteIntentSnapshotIsolation(t *testing.T) {
 	defer stopper.Stop()
 
 	key := proto.Key("a")
-	pusher := newTransaction("test", key, 1, proto.SERIALIZABLE, store.clock)
-	pushee := newTransaction("test", key, 1, proto.SNAPSHOT, store.clock)
+	pusher := newTransaction("test", key, 1, proto.SERIALIZABLE, store.ctx.Clock)
+	pushee := newTransaction("test", key, 1, proto.SNAPSHOT, store.ctx.Clock)
 	pushee.Priority = 2
 	pusher.Priority = 1 // Pusher would lose based on priority.
 
 	// First, write original value.
 	args, reply := putArgs(key, []byte("value1"), 1, store.StoreID())
-	args.Timestamp = store.clock.Now()
-	if err := store.ExecuteCmd(proto.Put, args, reply); err != nil {
+	args.Timestamp = store.ctx.Clock.Now()
+	if err := store.ExecuteCmd(args, reply); err != nil {
 		t.Fatal(err)
 	}
 
 	// Lay down intent using the pushee's txn.
-	args.Timestamp = store.clock.Now()
+	args.Timestamp = store.ctx.Clock.Now()
 	args.Txn = pushee
 	args.Value.Bytes = []byte("value2")
-	if err := store.ExecuteCmd(proto.Put, args, reply); err != nil {
+	if err := store.ExecuteCmd(args, reply); err != nil {
 		t.Fatal(err)
 	}
 
 	// Now, try to read value using the pusher's txn.
 	gArgs, gReply := getArgs(key, 1, store.StoreID())
-	gArgs.Timestamp = store.clock.Now()
+	gArgs.Timestamp = store.ctx.Clock.Now()
 	gArgs.Txn = pusher
-	if err := store.ExecuteCmd(proto.Get, gArgs, gReply); err != nil {
+	if err := store.ExecuteCmd(gArgs, gReply); err != nil {
 		t.Errorf("expected read to succeed: %s", err)
 	} else if !bytes.Equal(gReply.Value.Bytes, []byte("value1")) {
 		t.Errorf("expected bytes to be %q, got %q", "value1", gReply.Value.Bytes)
@@ -924,7 +917,7 @@ func TestStoreResolveWriteIntentSnapshotIsolation(t *testing.T) {
 	// commit timestamp is equal to gArgs.Timestamp + 1.
 	etArgs, etReply := endTxnArgs(pushee, true, 1, store.StoreID())
 	etArgs.Timestamp = pushee.Timestamp
-	if err := store.ExecuteCmd(proto.EndTransaction, etArgs, etReply); err != nil {
+	if err := store.ExecuteCmd(etArgs, etReply); err != nil {
 		t.Fatal(err)
 	}
 	expTimestamp := gArgs.Timestamp
@@ -943,33 +936,33 @@ func TestStoreResolveWriteIntentNoTxn(t *testing.T) {
 	defer stopper.Stop()
 
 	key := proto.Key("a")
-	pushee := newTransaction("test", key, 1, proto.SERIALIZABLE, store.clock)
+	pushee := newTransaction("test", key, 1, proto.SERIALIZABLE, store.ctx.Clock)
 	pushee.Priority = 0 // pushee should lose all conflicts
 
 	// First, lay down intent from pushee.
 	args, reply := putArgs(key, []byte("value1"), 1, store.StoreID())
 	args.Timestamp = pushee.Timestamp
 	args.Txn = pushee
-	if err := store.ExecuteCmd(proto.Put, args, reply); err != nil {
+	if err := store.ExecuteCmd(args, reply); err != nil {
 		t.Fatal(err)
 	}
 
 	// Now, try to read outside a transaction.
 	gArgs, gReply := getArgs(key, 1, store.StoreID())
-	gArgs.Timestamp = store.clock.Now()
+	gArgs.Timestamp = store.ctx.Clock.Now()
 	gArgs.UserPriority = gogoproto.Int32(math.MaxInt32)
-	if err := store.ExecuteCmd(proto.Get, gArgs, gReply); err != nil {
+	if err := store.ExecuteCmd(gArgs, gReply); err != nil {
 		t.Errorf("expected read to succeed: %s", err)
 	} else if gReply.Value != nil {
 		t.Errorf("expected value to be nil, got %+v", gReply.Value)
 	}
 
 	// Next, try to write outside of a transaction. We will succeed in pushing txn.
-	args.Timestamp = store.clock.Now()
+	args.Timestamp = store.ctx.Clock.Now()
 	args.Value.Bytes = []byte("value2")
 	args.Txn = nil
 	args.UserPriority = gogoproto.Int32(math.MaxInt32)
-	if err := store.ExecuteCmd(proto.Put, args, reply); err != nil {
+	if err := store.ExecuteCmd(args, reply); err != nil {
 		t.Errorf("expected success aborting pushee's txn; got %s", err)
 	}
 
@@ -1001,7 +994,7 @@ func TestStoreResolveWriteIntentNoTxn(t *testing.T) {
 	// been aborted.
 	etArgs, etReply := endTxnArgs(pushee, true, 1, store.StoreID())
 	etArgs.Timestamp = pushee.Timestamp
-	err = store.ExecuteCmd(proto.EndTransaction, etArgs, etReply)
+	err = store.ExecuteCmd(etArgs, etReply)
 	if err == nil {
 		t.Errorf("unexpected success committing transaction")
 	}
@@ -1022,19 +1015,19 @@ func TestStoreReadInconsistent(t *testing.T) {
 
 	// First, write keyA.
 	args, reply := putArgs(keyA, []byte("value1"), 1, store.StoreID())
-	if err := store.ExecuteCmd(proto.Put, args, reply); err != nil {
+	if err := store.ExecuteCmd(args, reply); err != nil {
 		t.Fatal(err)
 	}
 
 	// Next, write intents for keyA and keyB.
 	args.Value.Bytes = []byte("value2")
-	txnA := newTransaction("test", keyA, 1, proto.SERIALIZABLE, store.clock)
-	txnB := newTransaction("test", keyB, 1, proto.SERIALIZABLE, store.clock)
+	txnA := newTransaction("test", keyA, 1, proto.SERIALIZABLE, store.ctx.Clock)
+	txnB := newTransaction("test", keyB, 1, proto.SERIALIZABLE, store.ctx.Clock)
 	for _, txn := range []*proto.Transaction{txnA, txnB} {
 		args.Key = txn.Key
 		args.Timestamp = txn.Timestamp
 		args.Txn = txn
-		if err := store.ExecuteCmd(proto.Put, args, reply); err != nil {
+		if err := store.ExecuteCmd(args, reply); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1042,13 +1035,13 @@ func TestStoreReadInconsistent(t *testing.T) {
 	// Now, get from both keys and verify.
 	gArgs, gReply := getArgs(keyA, 1, store.StoreID())
 	gArgs.ReadConsistency = proto.INCONSISTENT
-	if err := store.ExecuteCmd(proto.Get, gArgs, gReply); err != nil {
+	if err := store.ExecuteCmd(gArgs, gReply); err != nil {
 		t.Errorf("expected read to succeed: %s", err)
-	} else if !bytes.Equal(gReply.Value.Bytes, []byte("value1")) {
-		t.Errorf("expected value %q, got %q", []byte("value1"), gReply.Value.Bytes)
+	} else if gReply.Value == nil || !bytes.Equal(gReply.Value.Bytes, []byte("value1")) {
+		t.Errorf("expected value %q, got %+v", []byte("value1"), gReply.Value)
 	}
 	gArgs.Key = keyB
-	if err := store.ExecuteCmd(proto.Get, gArgs, gReply); err != nil {
+	if err := store.ExecuteCmd(gArgs, gReply); err != nil {
 		t.Errorf("expected read to succeed: %s", err)
 	} else if gReply.Value != nil {
 		t.Errorf("expected value to be nil, got %+v", gReply.Value)
@@ -1057,7 +1050,7 @@ func TestStoreReadInconsistent(t *testing.T) {
 	// Scan keys and verify results.
 	sArgs, sReply := scanArgs(keyA, proto.KeyMax, 1, store.StoreID())
 	sArgs.ReadConsistency = proto.INCONSISTENT
-	if err := store.ExecuteCmd(proto.Scan, sArgs, sReply); err != nil {
+	if err := store.ExecuteCmd(sArgs, sReply); err != nil {
 		t.Errorf("expected scan to succeed: %s", err)
 	}
 	if l := len(sReply.Rows); l != 1 {

@@ -19,12 +19,11 @@ package storage
 
 import (
 	"bytes"
-	"flag"
 	"fmt"
-	"net"
 	"sort"
 	"sync"
 	"sync/atomic"
+	"testing"
 	"time"
 
 	"github.com/cockroachdb/cockroach/client"
@@ -38,6 +37,7 @@ import (
 	"github.com/cockroachdb/cockroach/util/log"
 	"github.com/coreos/etcd/raft/raftpb"
 	gogoproto "github.com/gogo/protobuf/proto"
+	"golang.org/x/net/context"
 )
 
 const (
@@ -47,10 +47,10 @@ const (
 	// cache entries.
 	GCResponseCacheExpiration = 1 * time.Hour
 	// raftIDAllocCount is the number of Raft IDs to allocate per allocation.
-	raftIDAllocCount = 10
-	// defaultScanInterval is the default value for the scan interval
-	// command line flag.
-	defaultScanInterval = 10 * time.Minute
+	raftIDAllocCount                = 10
+	defaultRaftTickInterval         = 10 * time.Millisecond
+	defaultHeartbeatIntervalTicks   = 3
+	defaultRaftElectionTimeoutTicks = 15
 	// ttlCapacityGossip is time-to-live for capacity-related info.
 	ttlCapacityGossip = 2 * time.Minute
 )
@@ -65,10 +65,15 @@ var (
 		MaxAttempts: 0, // retry indefinitely
 	}
 
-	scanInterval = flag.Duration("scan_interval", defaultScanInterval, "specify "+
-		"--scan_interval to adjust the target for the duration of a single scan "+
-		"through a store's ranges. The scan is slowed as necessary to approximately"+
-		"achieve this duration.")
+	// TestStoreContext has some fields initialized with values relevant
+	// in tests.
+	TestStoreContext = StoreContext{
+		RaftTickInterval:           100 * time.Millisecond,
+		RaftHeartbeatIntervalTicks: 1,
+		RaftElectionTimeoutTicks:   2,
+		ScanInterval:               10 * time.Minute,
+		Context:                    context.Background(),
+	}
 )
 
 var (
@@ -175,46 +180,6 @@ func (e *NotBootstrappedError) Error() string {
 	return "store has not been bootstrapped"
 }
 
-// NodeDescriptor holds details on node physical/network topology.
-type NodeDescriptor struct {
-	NodeID  proto.NodeID
-	Address net.Addr
-	Attrs   proto.Attributes // node specific attributes (e.g. datacenter, machine info)
-}
-
-// NodeIDToAddress looks up the address of the node from the given Gossip instance.
-func NodeIDToAddress(g *gossip.Gossip, nodeID proto.NodeID) (net.Addr, error) {
-	nodeIDKey := gossip.MakeNodeIDKey(nodeID)
-	info, err := g.GetInfo(nodeIDKey)
-	if info == nil || err != nil {
-		return nil, util.Errorf("Unable to lookup address for node: %d. Error: %s", nodeID, err)
-	}
-	return info.(*NodeDescriptor).Address, nil
-}
-
-// StoreDescriptor holds store information including store attributes,
-// node descriptor and store capacity.
-type StoreDescriptor struct {
-	StoreID  proto.StoreID
-	Attrs    proto.Attributes // store specific attributes (e.g. ssd, hdd, mem)
-	Node     NodeDescriptor
-	Capacity engine.StoreCapacity
-}
-
-// CombinedAttrs returns the full list of attributes for the store,
-// including both the node and store attributes.
-func (s *StoreDescriptor) CombinedAttrs() *proto.Attributes {
-	var a []string
-	a = append(a, s.Node.Attrs.Attrs...)
-	a = append(a, s.Attrs.Attrs...)
-	return &proto.Attributes{Attrs: a}
-}
-
-// Less compares two StoreDescriptors based on percentage of disk available.
-func (s StoreDescriptor) Less(b util.Ordered) bool {
-	return s.Capacity.PercentAvail() < b.(StoreDescriptor).Capacity.PercentAvail()
-}
-
 // storeRangeIterator is an implementation of rangeIterator which
 // cycles through a store's rangesByKey slice.
 type storeRangeIterator struct {
@@ -253,8 +218,50 @@ func (si *storeRangeIterator) Reset() {
 	si.index = 0
 }
 
-// StoreConfig contains various parameters of a Store.
-type StoreConfig struct {
+// A Store maintains a map of ranges by start key. A Store corresponds
+// to one physical device.
+type Store struct {
+	*StoreFinder
+
+	Ident          proto.StoreIdent
+	ctx            StoreContext
+	engine         engine.Engine   // The underlying key-value store
+	allocator      *allocator      // Makes allocation decisions
+	raftIDAlloc    *IDAllocator    // Raft ID allocator
+	gcQueue        *gcQueue        // Garbage collection queue
+	splitQueue     *splitQueue     // Range splitting queue
+	verifyQueue    *verifyQueue    // Checksum verification queue
+	replicateQueue *replicateQueue // Replication queue
+	scanner        *rangeScanner   // Range scanner
+	feed           StoreEventFeed  // Event Feed
+	multiraft      *multiraft.MultiRaft
+	started        int32
+	stopper        *util.Stopper
+	startedAt      int64
+	nodeDesc       *proto.NodeDescriptor
+
+	mu          sync.RWMutex     // Protects variables below...
+	ranges      map[int64]*Range // Map of ranges by Raft ID
+	rangesByKey RangeSlice       // Sorted slice of ranges by StartKey
+}
+
+var _ multiraft.Storage = &Store{}
+
+// A StoreContext encompasses the auxiliary objects and configuration
+// required to create a store.
+// All fields holding a pointer or an interface are required to create
+// a store; the rest will have sane defaults set if omitted.
+type StoreContext struct {
+	Clock     *hlc.Clock
+	DB        *client.KV
+	Gossip    *gossip.Gossip
+	Transport multiraft.Transport
+	Context   context.Context
+
+	// RangeRetryOptions are the retry options for ranges.
+	// TODO(tschottdorf) improve comment once I figure out what this is.
+	RangeRetryOptions util.RetryOptions
+
 	// RaftTickInterval is the resolution of the Raft timer; other raft timeouts
 	// are defined in terms of multiples of this value.
 	RaftTickInterval time.Duration
@@ -267,86 +274,63 @@ type StoreConfig struct {
 	// higher than RaftHeartbeatIntervalTicks. The raft paper recommends a value of 150ms
 	// for local networks.
 	RaftElectionTimeoutTicks int
+
+	// ScanInterval is the default value for the scan interval
+	ScanInterval time.Duration
+
+	// EventFeed is a feed to which this store will publish events.
+	EventFeed *util.Feed
+}
+
+// Valid returns true if the StoreContext is populated correctly.
+// We don't check for Gossip and DB since some of our tests pass
+// that as nil.
+func (sc *StoreContext) Valid() bool {
+	return sc.Clock != nil && sc.Context != nil && sc.Transport != nil &&
+		sc.RaftTickInterval != 0 && sc.RaftHeartbeatIntervalTicks > 0 &&
+		sc.RaftElectionTimeoutTicks > 0 && sc.ScanInterval > 0
 }
 
 // setDefaults initializes unset fields in StoreConfig to values
 // suitable for use on a local network.
-func (c *StoreConfig) setDefaults() {
-	if c.RaftTickInterval == 0 {
-		c.RaftTickInterval = 10 * time.Millisecond
+// TODO(tschottdorf) see if this ought to be configurable via flags.
+func (sc *StoreContext) setDefaults() {
+	if sc.RaftTickInterval == 0 {
+		sc.RaftTickInterval = defaultRaftTickInterval
 	}
-	if c.RaftHeartbeatIntervalTicks == 0 {
-		c.RaftHeartbeatIntervalTicks = 3
+	if sc.RaftHeartbeatIntervalTicks == 0 {
+		sc.RaftHeartbeatIntervalTicks = defaultHeartbeatIntervalTicks
 	}
-	if c.RaftElectionTimeoutTicks == 0 {
-		c.RaftElectionTimeoutTicks = 15
+	if sc.RaftElectionTimeoutTicks == 0 {
+		sc.RaftElectionTimeoutTicks = defaultRaftElectionTimeoutTicks
 	}
 }
-
-// TestStoreConfig is a StoreConfig for use in tests which uses very short timeouts.
-var TestStoreConfig = StoreConfig{
-	RaftTickInterval:           time.Millisecond,
-	RaftHeartbeatIntervalTicks: 1,
-	RaftElectionTimeoutTicks:   5,
-}
-
-// A Store maintains a map of ranges by start key. A Store corresponds
-// to one physical device.
-type Store struct {
-	*StoreFinder
-	StoreConfig
-
-	Ident          proto.StoreIdent
-	RetryOpts      util.RetryOptions
-	clock          *hlc.Clock
-	engine         engine.Engine       // The underlying key-value store
-	db             *client.KV          // Cockroach KV DB
-	allocator      *allocator          // Makes allocation decisions
-	gossip         *gossip.Gossip      // Configs and store capacities
-	transport      multiraft.Transport // Log replication traffic
-	raftIDAlloc    *IDAllocator        // Raft ID allocator
-	gcQueue        *gcQueue            // Garbage collection queue
-	splitQueue     *splitQueue         // Range splitting queue
-	verifyQueue    *verifyQueue        // Checksum verification queue
-	replicateQueue *replicateQueue     // Replication queue
-	scanner        *rangeScanner       // Range scanner
-	multiraft      *multiraft.MultiRaft
-	started        int32
-	stopper        *util.Stopper
-	status         *proto.StoreStatus
-
-	mu          sync.RWMutex     // Protects variables below...
-	ranges      map[int64]*Range // Map of ranges by Raft ID
-	rangesByKey RangeSlice       // Sorted slice of ranges by StartKey
-}
-
-var _ multiraft.Storage = &Store{}
 
 // NewStore returns a new instance of a store.
-func NewStore(clock *hlc.Clock, eng engine.Engine, db *client.KV, gossip *gossip.Gossip,
-	transport multiraft.Transport, config StoreConfig) *Store {
-	config.setDefaults()
-	sf := newStoreFinder(gossip)
+func NewStore(ctx StoreContext, eng engine.Engine, nodeDesc *proto.NodeDescriptor) *Store {
+	// TODO(tschottdorf) find better place to set these defaults.
+	ctx.setDefaults()
+
+	if !ctx.Valid() {
+		panic(fmt.Sprintf("invalid store configuration: %+v", &ctx))
+	}
+
+	sf := newStoreFinder(ctx.Gossip)
 	s := &Store{
+		ctx:         ctx,
 		StoreFinder: sf,
-		StoreConfig: config,
-		RetryOpts:   defaultRangeRetryOptions,
-		clock:       clock,
 		engine:      eng,
-		db:          db,
 		allocator:   newAllocator(sf.findStores),
-		gossip:      gossip,
-		transport:   transport,
 		ranges:      map[int64]*Range{},
-		status:      &proto.StoreStatus{},
+		nodeDesc:    nodeDesc,
 	}
 
 	// Add range scanner and configure with queues.
-	s.scanner = newRangeScanner(defaultScanInterval, newStoreRangeIterator(s))
+	s.scanner = newRangeScanner(ctx.ScanInterval, newStoreRangeIterator(s), s.updateStoreStatus)
 	s.gcQueue = newGCQueue()
-	s.splitQueue = newSplitQueue(db, gossip)
+	s.splitQueue = newSplitQueue(s.ctx.DB, s.ctx.Gossip)
 	s.verifyQueue = newVerifyQueue(s.scanner.Stats)
-	s.replicateQueue = newReplicateQueue(gossip, s.allocator, clock)
+	s.replicateQueue = newReplicateQueue(s.ctx.Gossip, s.allocator, s.ctx.Clock)
 	s.scanner.AddQueues(s.gcQueue, s.splitQueue, s.verifyQueue, s.replicateQueue)
 
 	return s
@@ -384,17 +368,29 @@ func (s *Store) Start(stopper *util.Stopper) error {
 		}
 	}
 
+	// If the nodeID is 0, it has not be assigned yet.
+	// TODO(bram): Figure out how to remove this special case.
+	if s.nodeDesc.NodeID != 0 && s.Ident.NodeID != s.nodeDesc.NodeID {
+		return util.Errorf("node id:%d does not equal the one in node descriptor:%d", s.Ident.NodeID, s.nodeDesc.NodeID)
+	}
+
+	// Start store event feed.
+	s.feed = NewStoreEventFeed(s.Ident.StoreID, s.ctx.EventFeed)
+	s.feed.startStore()
+
 	// Create ID allocators.
-	idAlloc, err := NewIDAllocator(engine.KeyRaftIDGenerator, s.db, 2 /* min ID */, raftIDAllocCount, s.stopper)
+	idAlloc, err := NewIDAllocator(engine.KeyRaftIDGenerator, s.ctx.DB, 2 /* min ID */, raftIDAllocCount, s.stopper)
 	if err != nil {
 		return err
 	}
 	s.raftIDAlloc = idAlloc
 
+	now := s.ctx.Clock.Now()
+	s.startedAt = now.WallTime
+
 	// GCTimeouts method is called each time an engine compaction is
 	// underway. It sets minimum timeouts for transaction records and
 	// response cache entries.
-	now := s.clock.Now()
 	minTxnTS := int64(0) // disable GC of transactions until we know minimum write intent age
 	minRCacheTS := now.WallTime - GCResponseCacheExpiration.Nanoseconds()
 	s.engine.SetGCTimeouts(minTxnTS, minRCacheTS)
@@ -404,12 +400,12 @@ func (s *Store) Start(stopper *util.Stopper) error {
 	end := engine.RangeDescriptorKey(engine.KeyMax)
 
 	if s.multiraft, err = multiraft.NewMultiRaft(s.RaftNodeID(), &multiraft.Config{
-		Transport:              s.transport,
+		Transport:              s.ctx.Transport,
 		Storage:                s,
 		StateMachine:           s,
-		TickInterval:           s.RaftTickInterval,
-		ElectionTimeoutTicks:   s.RaftElectionTimeoutTicks,
-		HeartbeatIntervalTicks: s.RaftHeartbeatIntervalTicks,
+		TickInterval:           s.ctx.RaftTickInterval,
+		ElectionTimeoutTicks:   s.ctx.RaftElectionTimeoutTicks,
+		HeartbeatIntervalTicks: s.ctx.RaftHeartbeatIntervalTicks,
 		EntryFormatter:         raftEntryFormatter,
 	}); err != nil {
 		return err
@@ -419,6 +415,7 @@ func (s *Store) Start(stopper *util.Stopper) error {
 	// (consistent=false). Uncommitted intents which have been abandoned
 	// due to a split crashing halfway will simply be resolved on the
 	// next split attempt. They can otherwise be ignored.
+	s.feed.beginScanRanges()
 	if err := engine.MVCCIterate(s.engine, start, end, now, false, nil, func(kv proto.KeyValue) (bool, error) {
 		// Only consider range metadata entries; ignore others.
 		_, suffix, _ := engine.DecodeRangeKey(kv.Key)
@@ -439,6 +436,7 @@ func (s *Store) Start(stopper *util.Stopper) error {
 		if err != nil {
 			return false, err
 		}
+		s.feed.addRange(rng)
 		// Note that we do not create raft groups at this time; they will be created
 		// on-demand the first time they are needed. This helps reduce the amount of
 		// election-related traffic in a cold start.
@@ -451,6 +449,8 @@ func (s *Store) Start(stopper *util.Stopper) error {
 	}); err != nil {
 		return err
 	}
+	s.feed.endScanRanges()
+
 	// Sort the rangesByKey slice after they've all been added.
 	sort.Sort(s.rangesByKey)
 
@@ -459,31 +459,53 @@ func (s *Store) Start(stopper *util.Stopper) error {
 	s.processRaft()
 
 	// Start the scanner.
-	s.scanner.Start(s.clock, s.stopper)
+	s.scanner.Start(s.ctx.Clock, s.stopper)
 
 	// Register callbacks for any changes to accounting and zone
-	// configurations; we split ranges along prefix boundaries.
+	// configurations; we split ranges along prefix boundaries to
+	// avoid having a range that has two different accounting/zone
+	// configs. (We don't need a callback for permissions since
+	// permissions don't have such a requirement.)
+	//
 	// Gossip is only ever nil for unittests.
-	if s.gossip != nil {
-		s.gossip.RegisterCallback(gossip.KeyConfigAccounting, s.configGossipUpdate)
-		s.gossip.RegisterCallback(gossip.KeyConfigZone, s.configGossipUpdate)
+	if s.ctx.Gossip != nil {
+		s.ctx.Gossip.RegisterCallback(gossip.KeyConfigAccounting, s.configGossipUpdate)
+		s.ctx.Gossip.RegisterCallback(gossip.KeyConfigZone, s.configGossipUpdate)
 		// Callback triggers on capacity gossip from all stores.
 		capacityRegex := gossip.MakePrefixPattern(gossip.KeyMaxAvailCapacityPrefix)
-		s.gossip.RegisterCallback(capacityRegex, s.capacityGossipUpdate)
+		s.ctx.Gossip.RegisterCallback(capacityRegex, s.capacityGossipUpdate)
 	}
+
+	// Start a single goroutine in charge of periodically gossipping the
+	// sentinel and first range metadata if we have a first range.
+	s.startGossip()
 
 	// Set the started flag (for unittests).
 	atomic.StoreInt32(&s.started, 1)
 
-	// Update the store status.
-	s.status.StoreID = s.Ident.StoreID
-	s.status.NodeID = s.Ident.NodeID
-	s.status.StartedAt = now.WallTime
-	if err := s.updateStoreStatus(); err != nil {
-		return err
-	}
-
 	return nil
+}
+
+// startGossip runs an infinite loop in a goroutine which regularly checks
+// whether the store has a first range replica and asks that range to gossip
+// cluster ID and first range metadata accordingly.
+func (s *Store) startGossip() {
+	s.stopper.RunWorker(func() {
+		ticker := time.NewTicker(ttlClusterIDGossip / 2)
+		for {
+			select {
+			case <-ticker.C:
+				rng := s.LookupRange(engine.KeyMin, engine.KeyMin.Next())
+				if rng != nil {
+					log.V(1).Infof("store %d has first range, maybe gossiping",
+						s.StoreID())
+					rng.maybeGossipFirstRangeWithLease()
+				}
+			case <-s.stopper.ShouldStop():
+				return
+			}
+		}
+	})
 }
 
 // configGossipUpdate is a callback for gossip updates to
@@ -492,7 +514,7 @@ func (s *Store) configGossipUpdate(key string, contentsChanged bool) {
 	if !contentsChanged {
 		return // Skip update if it's just a newer timestamp or fewer hops to info
 	}
-	info, err := s.gossip.GetInfo(key)
+	info, err := s.ctx.Gossip.GetInfo(key)
 	if err != nil {
 		log.Errorf("unable to fetch %s config from gossip: %s", key, err)
 		return
@@ -511,8 +533,8 @@ func (s *Store) configGossipUpdate(key string, contentsChanged bool) {
 }
 
 // GossipCapacity broadcasts the node's capacity on the gossip network.
-func (s *Store) GossipCapacity(n *NodeDescriptor) {
-	storeDesc, err := s.Descriptor(n)
+func (s *Store) GossipCapacity() {
+	storeDesc, err := s.Descriptor()
 	if err != nil {
 		log.Warningf("problem getting store descriptor for store %+v: %v", s.Ident, err)
 		return
@@ -520,7 +542,7 @@ func (s *Store) GossipCapacity(n *NodeDescriptor) {
 	// Unique gossip key per store.
 	keyMaxCapacity := gossip.MakeMaxAvailCapacityKey(storeDesc.Node.NodeID, storeDesc.StoreID)
 	// Gossip store descriptor.
-	s.gossip.AddInfo(keyMaxCapacity, *storeDesc, ttlCapacityGossip)
+	s.ctx.Gossip.AddInfo(keyMaxCapacity, *storeDesc, ttlCapacityGossip)
 }
 
 // maybeSplitRangesByConfigs determines ranges which should be
@@ -534,23 +556,22 @@ func (s *Store) maybeSplitRangesByConfigs(configMap PrefixConfigMap) {
 		n := sort.Search(len(s.rangesByKey), func(i int) bool {
 			return config.Prefix.Less(s.rangesByKey[i].Desc().EndKey)
 		})
-		// If the config doesn't split the range or the range isn't the
-		// leader of its consensus group, continue.
-		if n >= len(s.rangesByKey) || !s.rangesByKey[n].Desc().ContainsKey(config.Prefix) || !s.rangesByKey[n].IsLeader() {
+		// If the config doesn't split the range, continue.
+		if n >= len(s.rangesByKey) || !s.rangesByKey[n].Desc().ContainsKey(config.Prefix) {
 			continue
 		}
-		s.splitQueue.MaybeAdd(s.rangesByKey[n], s.clock.Now())
+		s.splitQueue.MaybeAdd(s.rangesByKey[n], s.ctx.Clock.Now())
 	}
 }
 
-// ForceReplicationScan iterates over all ranges and enqueues any that need to be
-// replicated. Exposed only for testing.
-func (s *Store) ForceReplicationScan() {
+// ForceReplicationScan iterates over all ranges and enqueues any that
+// need to be replicated. Exposed only for testing.
+func (s *Store) ForceReplicationScan(t testing.TB) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	for _, r := range s.ranges {
-		s.replicateQueue.MaybeAdd(r, s.clock.Now())
+		s.replicateQueue.MaybeAdd(r, s.ctx.Clock.Now())
 	}
 }
 
@@ -614,7 +635,6 @@ func (s *Store) GetRange(raftID int64) (*Range, error) {
 	if rng, ok := s.ranges[raftID]; ok {
 		return rng, nil
 	}
-	log.Infof("couldn't find range %d in %s", raftID, s.ranges)
 	return nil, proto.NewRangeNotFoundError(raftID)
 }
 
@@ -658,8 +678,8 @@ func (s *Store) BootstrapRange() error {
 		},
 	}
 	batch := s.engine.NewBatch()
-	ms := &engine.MVCCStats{}
-	now := s.clock.Now()
+	ms := &proto.MVCCStats{}
+	now := s.ctx.Clock.Now()
 
 	// Range descriptor.
 	if err := engine.MVCCPutProto(batch, ms, engine.RangeDescriptorKey(desc.StartKey), now, nil, desc); err != nil {
@@ -721,7 +741,7 @@ func (s *Store) BootstrapRange() error {
 		return err
 	}
 
-	ms.MergeStats(batch, 1)
+	engine.MergeStats(ms, batch, 1)
 	if err := batch.Commit(); err != nil {
 		return err
 	}
@@ -742,29 +762,39 @@ func (s *Store) RaftNodeID() multiraft.NodeID {
 }
 
 // Clock accessor.
-func (s *Store) Clock() *hlc.Clock { return s.clock }
+func (s *Store) Clock() *hlc.Clock { return s.ctx.Clock }
 
 // Engine accessor.
 func (s *Store) Engine() engine.Engine { return s.engine }
 
 // DB accessor.
-func (s *Store) DB() *client.KV { return s.db }
+func (s *Store) DB() *client.KV { return s.ctx.DB }
 
 // Allocator accessor.
 func (s *Store) Allocator() *allocator { return s.allocator }
 
 // Gossip accessor.
-func (s *Store) Gossip() *gossip.Gossip { return s.gossip }
+func (s *Store) Gossip() *gossip.Gossip { return s.ctx.Gossip }
 
 // SplitQueue accessor.
 func (s *Store) SplitQueue() *splitQueue { return s.splitQueue }
+
+// Stopper accessor.
+func (s *Store) Stopper() *util.Stopper { return s.stopper }
+
+// EventFeed accessor.
+func (s *Store) EventFeed() StoreEventFeed { return s.feed }
 
 // NewRangeDescriptor creates a new descriptor based on start and end
 // keys and the supplied proto.Replicas slice. It allocates new Raft
 // and range IDs to fill out the supplied replicas.
 func (s *Store) NewRangeDescriptor(start, end proto.Key, replicas []proto.Replica) (*proto.RangeDescriptor, error) {
+	id, err := s.raftIDAlloc.Allocate()
+	if err != nil {
+		return nil, err
+	}
 	desc := &proto.RangeDescriptor{
-		RaftID:   s.raftIDAlloc.Allocate(),
+		RaftID:   id,
 		StartKey: start,
 		EndKey:   end,
 		Replicas: append([]proto.Replica(nil), replicas...),
@@ -786,39 +816,37 @@ func (s *Store) SplitRange(origRng, newRng *Range) error {
 	copy.EndKey = append([]byte(nil), newRng.Desc().StartKey...)
 	origRng.SetDesc(&copy)
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	err := s.addRangeInternal(newRng, true)
-	s.mu.Unlock()
 	if err != nil {
 		return err
 	}
-	if err := s.multiraft.CreateGroup(uint64(newRng.Desc().RaftID)); err != nil {
-		return err
-	}
+	s.feed.splitRange(origRng, newRng)
 	return nil
 }
 
 // MergeRange expands the subsuming range to absorb the subsumed range.
 // This merge operation will fail if the two ranges are not collocated
-// on the same store. Returns the subsumed range.
-func (s *Store) MergeRange(subsumingRng *Range, updatedEndKey proto.Key, subsumedRaftID int64) (*Range, error) {
+// on the same store.
+func (s *Store) MergeRange(subsumingRng *Range, updatedEndKey proto.Key, subsumedRaftID int64) error {
 	if !subsumingRng.Desc().EndKey.Less(updatedEndKey) {
-		return nil, util.Errorf("the new end key is not greater than the current one: %+v < %+v",
+		return util.Errorf("the new end key is not greater than the current one: %+v <= %+v",
 			updatedEndKey, subsumingRng.Desc().EndKey)
 	}
 
 	subsumedRng, err := s.GetRange(subsumedRaftID)
 	if err != nil {
-		return nil, util.Errorf("Could not find the subsumed range: %d", subsumedRaftID)
+		return util.Errorf("could not find the subsumed range: %d", subsumedRaftID)
 	}
 
 	if !ReplicaSetsEqual(subsumedRng.Desc().GetReplicas(), subsumingRng.Desc().GetReplicas()) {
-		return nil, util.Errorf("Ranges are not on the same replicas sets: %+v=%+v",
+		return util.Errorf("ranges are not on the same replicas sets: %+v != %+v",
 			subsumedRng.Desc().GetReplicas(), subsumingRng.Desc().GetReplicas())
 	}
 
 	// Remove and destroy the subsumed range.
 	if err = s.RemoveRange(subsumedRng); err != nil {
-		return nil, util.Errorf("cannot remove range %s", err)
+		return util.Errorf("cannot remove range %s", err)
 	}
 
 	// TODO(bram): The removed range needs to have all of its metadata removed.
@@ -828,21 +856,20 @@ func (s *Store) MergeRange(subsumingRng *Range, updatedEndKey proto.Key, subsume
 	copy.EndKey = updatedEndKey
 	subsumingRng.SetDesc(&copy)
 
-	return subsumedRng, nil
+	s.feed.mergeRange(subsumingRng, subsumedRng)
+	return nil
 }
 
 // AddRange adds the range to the store's range map and to the sorted
 // rangesByKey slice.
 func (s *Store) AddRange(rng *Range) error {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	err := s.addRangeInternal(rng, true)
-	s.mu.Unlock()
 	if err != nil {
 		return err
 	}
-	if err := s.multiraft.CreateGroup(uint64(rng.Desc().RaftID)); err != nil {
-		return err
-	}
+	s.feed.addRange(rng)
 	return nil
 }
 
@@ -853,7 +880,7 @@ func (s *Store) AddRange(rng *Range) error {
 // is held. Returns a rangeAlreadyExists error if a range with the
 // same Raft ID has already been added to this store.
 func (s *Store) addRangeInternal(rng *Range, resort bool) error {
-	rng.start(s.stopper)
+	rng.start()
 	// TODO(spencer); will need to determine which range is
 	// newer, and keep that one.
 	if exRng, ok := s.ranges[rng.Desc().RaftID]; ok {
@@ -884,7 +911,7 @@ func (s *Store) RemoveRange(rng *Range) error {
 	n := sort.Search(len(s.rangesByKey), func(i int) bool {
 		return bytes.Compare(rng.Desc().StartKey, s.rangesByKey[i].Desc().EndKey) < 0
 	})
-	if n >= len(s.rangesByKey) {
+	if n >= len(s.rangesByKey) || rng.Desc().RaftID != s.rangesByKey[n].Desc().RaftID {
 		return util.Errorf("couldn't find range in rangesByKey slice")
 	}
 	s.rangesByKey = append(s.rangesByKey[:n], s.rangesByKey[n+1:]...)
@@ -902,22 +929,22 @@ func (s *Store) Attrs() proto.Attributes {
 }
 
 // Capacity returns the capacity of the underlying storage engine.
-func (s *Store) Capacity() (engine.StoreCapacity, error) {
+func (s *Store) Capacity() (proto.StoreCapacity, error) {
 	return s.engine.Capacity()
 }
 
 // Descriptor returns a StoreDescriptor including current store
 // capacity information.
-func (s *Store) Descriptor(nodeDesc *NodeDescriptor) (*StoreDescriptor, error) {
+func (s *Store) Descriptor() (*proto.StoreDescriptor, error) {
 	capacity, err := s.Capacity()
 	if err != nil {
 		return nil, err
 	}
 	// Initialize the store descriptor.
-	return &StoreDescriptor{
+	return &proto.StoreDescriptor{
 		StoreID:  s.Ident.StoreID,
 		Attrs:    s.Attrs(),
-		Node:     *nodeDesc,
+		Node:     *s.nodeDesc,
 		Capacity: capacity,
 	}, nil
 }
@@ -925,22 +952,19 @@ func (s *Store) Descriptor(nodeDesc *NodeDescriptor) (*StoreDescriptor, error) {
 // ExecuteCmd fetches a range based on the header's replica, assembles
 // method, args & reply into a Raft Cmd struct and executes the
 // command using the fetched range.
-func (s *Store) ExecuteCmd(method string, args proto.Request, reply proto.Response) error {
+func (s *Store) ExecuteCmd(args proto.Request, reply proto.Response) error {
 	// If the request has a zero timestamp, initialize to this node's clock.
 	header := args.Header()
 	if err := verifyKeys(header.Key, header.EndKey); err != nil {
 		reply.Header().SetGoError(err)
 		return err
 	}
-	if header.Timestamp.Equal(proto.ZeroTimestamp) {
-		// Update the incoming timestamp if unset.
-		header.Timestamp = s.clock.Now()
-	} else {
-		// Otherwise, update our clock with the incoming request. This
+	if !header.Timestamp.Equal(proto.ZeroTimestamp) {
+		// Update our clock with the incoming request timestamp. This
 		// advances the local node's clock to a high water mark from
 		// amongst all nodes with which it has interacted. The update is
 		// bounded by the max clock drift.
-		_, err := s.clock.Update(header.Timestamp)
+		_, err := s.ctx.Clock.Update(header.Timestamp)
 		if err != nil {
 			reply.Header().SetGoError(err)
 			return err
@@ -948,8 +972,8 @@ func (s *Store) ExecuteCmd(method string, args proto.Request, reply proto.Respon
 	}
 
 	// Backoff and retry loop for handling errors.
-	retryOpts := s.RetryOpts
-	retryOpts.Tag = fmt.Sprintf("store: %s", method)
+	retryOpts := s.ctx.RangeRetryOptions
+	retryOpts.Tag = fmt.Sprintf("store: %s", args.Method())
 	err := util.RetryWithBackoff(retryOpts, func() (util.RetryStatus, error) {
 		// Add the command to the range for execution; exit retry loop on success.
 		reply.Reset()
@@ -961,7 +985,7 @@ func (s *Store) ExecuteCmd(method string, args proto.Request, reply proto.Respon
 			return util.RetryBreak, err
 		}
 
-		if err = rng.AddCmd(method, args, reply, true); err == nil {
+		if err = rng.AddCmd(args, reply, true); err == nil {
 			return util.RetryBreak, nil
 		}
 
@@ -969,7 +993,7 @@ func (s *Store) ExecuteCmd(method string, args proto.Request, reply proto.Respon
 		// because this is the code path with the requesting client
 		// waiting. We don't want every replica to attempt to resolve the
 		// intent independently, so we can't do it in Range.executeCmd.
-		err = s.maybeResolveWriteIntentError(rng, method, args, reply)
+		err = s.maybeResolveWriteIntentError(rng, args, reply)
 
 		switch t := err.(type) {
 		case *proto.WriteTooOldError:
@@ -984,13 +1008,13 @@ func (s *Store) ExecuteCmd(method string, args proto.Request, reply proto.Respon
 				return util.RetryReset, nil
 			}
 			// Otherwise, update timestamp on read/write and backoff / retry.
-			if proto.IsReadWrite(method) && header.Timestamp.Less(t.Txn.Timestamp) {
+			if proto.IsWrite(args) && header.Timestamp.Less(t.Txn.Timestamp) {
 				header.Timestamp = t.Txn.Timestamp
 				header.Timestamp.Logical++
 			}
 			return util.RetryContinue, nil
 		}
-		return util.RetryBreak, nil
+		return util.RetryBreak, err
 	})
 
 	// By default, retries are indefinite. However, some unittests set a
@@ -1011,14 +1035,14 @@ func (s *Store) ExecuteCmd(method string, args proto.Request, reply proto.Respon
 // error's Resolved flag to true so the client retries the command
 // immediately. If the push fails, we set the error's Resolved flag to
 // false so that the client backs off before reissuing the command.
-func (s *Store) maybeResolveWriteIntentError(rng *Range, method string, args proto.Request, reply proto.Response) error {
+func (s *Store) maybeResolveWriteIntentError(rng *Range, args proto.Request, reply proto.Response) error {
 	err := reply.Header().GoError()
 	wiErr, ok := err.(*proto.WriteIntentError)
 	if !ok {
 		return err
 	}
 
-	log.V(1).Infof("resolving write intent on %s %q: %s", method, args.Header().Key, wiErr)
+	log.V(1).Infof("resolving write intent on %s %q: %s", args.Method(), args.Header().Key, wiErr)
 
 	// Attempt to push the transaction which created the conflicting intent.
 	pushArgs := &proto.InternalPushTxnRequest{
@@ -1030,10 +1054,10 @@ func (s *Store) maybeResolveWriteIntentError(rng *Range, method string, args pro
 			Txn:          args.Header().Txn,
 		},
 		PusheeTxn: wiErr.Txn,
-		Abort:     proto.IsReadWrite(method), // abort if cmd is read/write
+		Abort:     proto.IsWrite(args), // abort if cmd is write
 	}
 	pushReply := &proto.InternalPushTxnResponse{}
-	s.db.Call(proto.InternalPushTxn, pushArgs, pushReply)
+	s.ctx.DB.Run(client.Call{Args: pushArgs, Reply: pushReply})
 	if pushErr := pushReply.GoError(); pushErr != nil {
 		log.V(1).Infof("push %q failed: %s", pushArgs.Header().Key, pushErr)
 
@@ -1041,7 +1065,7 @@ func (s *Store) maybeResolveWriteIntentError(rng *Range, method string, args pro
 		// push failure, not the original write intent error. The push
 		// failure will instruct the client to restart the transaction
 		// with a backoff.
-		if args.Header().Txn != nil && proto.IsReadWrite(method) {
+		if args.Header().Txn != nil && proto.IsWrite(args) {
 			reply.Header().SetGoError(pushErr)
 			return pushErr
 		}
@@ -1066,7 +1090,7 @@ func (s *Store) maybeResolveWriteIntentError(rng *Range, method string, args pro
 	}
 	resolveReply := &proto.InternalResolveIntentResponse{}
 	// Add resolve command with wait=false to add to Raft but not wait for completion.
-	if resolveErr := rng.AddCmd(proto.InternalResolveIntent, resolveArgs, resolveReply, false); resolveErr != nil {
+	if resolveErr := rng.AddCmd(resolveArgs, resolveReply, false); resolveErr != nil {
 		log.Warningf("resolve of key %q failed: %s", wiErr.Key, resolveErr)
 	}
 
@@ -1112,21 +1136,6 @@ func (s *Store) ProposeRaftCommand(idKey cmdIDKey, cmd proto.InternalRaftCommand
 // by the raft consensus algorithm, dispatching them to the
 // appropriate range. This method starts a goroutine to process Raft
 // commands indefinitely or until the stopper signals.
-//
-// TODO(bdarnell): when Raft elects this node as the leader for any
-//   of its ranges, we need to be careful to do the following before
-//   the range is allowed to believe it's the leader and begin to accept
-//   writes and reads:
-//     - Apply all committed log entries to the state machine.
-//     - Signal the range to clear its read timestamp, response caches
-//       and pending read queue.
-//     - Signal the range that it's now the leader with the duration
-//       of its leader lease.
-//   If we don't do this, then a read which was previously gated on
-//   the former leader waiting for overlapping writes to commit to
-//   the underlying state machine, might transit to the new leader
-//   and be able to access the new leader's state machine BEFORE
-//   the overlapping writes are applied.
 func (s *Store) processRaft() {
 	s.stopper.RunWorker(func() {
 		for {
@@ -1158,34 +1167,6 @@ func (s *Store) processRaft() {
 						log.Fatal(err)
 					}
 
-				case *multiraft.EventLeaderElection:
-					if e.NodeID == 0 {
-						// Election in progress.
-						continue
-					}
-					// Only the store housing the election winner gets to
-					// proceed.
-					groupID = int64(e.GroupID)
-					r, err := s.GetRange(groupID)
-					if err != nil {
-						log.Warning(err)
-						continue
-					}
-					if e.NodeID != s.RaftNodeID() {
-						// TODO(tschottdorf): Fatalf if we think we have a leader
-						// lease for that group, during which we're not supposed to
-						// get a message like that.
-						// if r.HaveLeaderLease() {
-						//   log.Fatalf("have leader lease, but other node requests it")
-						// }
-						continue
-					}
-
-					r.requestLeaderLease(e.Term)
-
-					// Done with this event, go back to listening on the channel.
-					continue
-
 				default:
 					continue
 				}
@@ -1194,9 +1175,9 @@ func (s *Store) processRaft() {
 					log.Fatalf("e.GroupID (%d) should == cmd.RaftID (%d)", groupID, cmd.RaftID)
 				}
 
-				s.mu.Lock()
+				s.mu.RLock()
 				r, ok := s.ranges[groupID]
-				s.mu.Unlock()
+				s.mu.RUnlock()
 				var err error
 				if !ok {
 					err = util.Errorf("got committed raft command for %d but have no range with that ID: %+v",
@@ -1241,8 +1222,8 @@ func (s *Store) GroupStorage(groupID uint64) multiraft.WriteableGroupStorage {
 
 // AppliedIndex implements the multiraft.StateMachine interface.
 func (s *Store) AppliedIndex(groupID uint64) (uint64, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	r, ok := s.ranges[int64(groupID)]
 	if !ok {
 		return 0, util.Errorf("range %d not found", groupID)
@@ -1266,17 +1247,54 @@ func raftEntryFormatter(data []byte) string {
 	return s
 }
 
-// updateStoreStatus updates the store's status proto.
-func (s *Store) updateStoreStatus() error {
-	now := s.clock.Now().WallTime
-	s.status.UpdatedAt = now
-	s.status.RaftIDs = []int64{}
-	for raftID := range s.ranges {
-		s.status.RaftIDs = append(s.status.RaftIDs, raftID)
+// GetStatus fetches the latest store status from the stored value on the cluster.
+// Returns nil if the scanner has not yet run.  The scanner runs once every
+// ctx.ScanInterval.
+func (s *Store) GetStatus() (*proto.StoreStatus, error) {
+	if s.scanner.Count() == 0 {
+		// The scanner hasn't completed a first run yet.
+		return nil, nil
 	}
 	key := engine.StoreStatusKey(int32(s.Ident.StoreID))
-	if err := engine.MVCCPutProto(s.engine, nil, key, proto.ZeroTimestamp, nil, s.status); err != nil {
-		return err
+	storeStatus := &proto.StoreStatus{}
+	if err := s.ctx.DB.Run(client.GetProto(key, storeStatus)); err != nil {
+		return nil, err
 	}
-	return nil
+	return storeStatus, nil
+}
+
+// WaitForRangeScanCompletion waits until the next range scan is complete and
+// returns the total number of scans completed so far.  This is exposed for use
+// in unit tests.
+func (s *Store) WaitForRangeScanCompletion() int64 {
+	return s.scanner.WaitForScanCompletion()
+}
+
+// updateStoreStatus updates the store's status proto.
+func (s *Store) updateStoreStatus() {
+	now := s.ctx.Clock.Now().WallTime
+	scannerStats := s.scanner.Stats()
+
+	desc, err := s.Descriptor()
+	if err != nil {
+		log.Error(err)
+		return
+	}
+	status := &proto.StoreStatus{
+		Desc:       *desc,
+		NodeID:     s.Ident.NodeID,
+		UpdatedAt:  now,
+		StartedAt:  s.startedAt,
+		RangeCount: int32(scannerStats.RangeCount),
+		Stats:      proto.MVCCStats(scannerStats.MVCC),
+	}
+	key := engine.StoreStatusKey(int32(s.Ident.StoreID))
+	if err := s.ctx.DB.Run(client.PutProto(key, status)); err != nil {
+		log.Error(err)
+	}
+}
+
+// SetRangeRetryOptions sets the retry options used for this store.
+func (s *Store) SetRangeRetryOptions(ro util.RetryOptions) {
+	s.ctx.RangeRetryOptions = ro
 }

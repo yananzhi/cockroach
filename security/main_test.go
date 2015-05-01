@@ -15,8 +15,16 @@
 //
 // Author: Tobias Schottdorf (tobias.schottdorf@gmail.com)
 
-// Package rpctest embeds the TLS test certificates.
-package rpctest
+package security
 
-//go:generate go-bindata -pkg rpctest -mode 0644 -modtime 1400000000 -o ./embedded.go -prefix ../../resource ../../resource/test_certs/...
-//go:generate goimports -w embedded.go
+import "github.com/cockroachdb/cockroach/security/securitytest"
+
+func init() {
+	ResetTest()
+}
+
+// ResetTest sets up the test environment. In particular, it embeds the
+// test_certs folder and makes the tls package load from there.
+func ResetTest() {
+	SetReadFileFn(securitytest.Asset)
+}

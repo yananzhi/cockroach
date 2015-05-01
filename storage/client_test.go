@@ -30,6 +30,7 @@ import (
 	"reflect"
 	"sort"
 	"testing"
+	"time"
 
 	"github.com/cockroachdb/cockroach/client"
 	"github.com/cockroachdb/cockroach/gossip"
@@ -37,6 +38,7 @@ import (
 	"github.com/cockroachdb/cockroach/multiraft"
 	"github.com/cockroachdb/cockroach/proto"
 	"github.com/cockroachdb/cockroach/rpc"
+	"github.com/cockroachdb/cockroach/security"
 	"github.com/cockroachdb/cockroach/storage"
 	"github.com/cockroachdb/cockroach/storage/engine"
 	"github.com/cockroachdb/cockroach/util"
@@ -52,23 +54,31 @@ func createTestStore(t *testing.T) (*storage.Store, *util.Stopper) {
 	return createTestStoreWithEngine(t,
 		engine.NewInMem(proto.Attributes{}, 10<<20),
 		hlc.NewClock(hlc.NewManualClock(0).UnixNano),
-		true)
+		true, nil)
 }
 
 // createTestStoreWithEngine creates a test store using the given engine and clock.
 // The caller is responsible for closing the store on exit.
 func createTestStoreWithEngine(t *testing.T, eng engine.Engine, clock *hlc.Clock,
-	bootstrap bool) (*storage.Store, *util.Stopper) {
-	rpcContext := rpc.NewContext(hlc.NewClock(hlc.UnixNano), rpc.LoadInsecureTLSConfig())
-	g := gossip.New(rpcContext, gossip.TestInterval, gossip.TestBootstrap)
+	bootstrap bool, context *storage.StoreContext) (*storage.Store, *util.Stopper) {
 	stopper := util.NewStopper()
+	rpcContext := rpc.NewContext(hlc.NewClock(hlc.UnixNano), security.LoadInsecureTLSConfig(), stopper)
+	var ctx *storage.StoreContext
+	if context == nil {
+		ctx = &storage.StoreContext{}
+		*ctx = storage.TestStoreContext
+	} else {
+		ctx = context
+	}
+	ctx.Gossip = gossip.New(rpcContext, gossip.TestInterval, gossip.TestBootstrap)
 	lSender := kv.NewLocalSender()
 	sender := kv.NewTxnCoordSender(lSender, clock, false, stopper)
-	db := client.NewKV(nil, sender)
-	db.User = storage.UserRoot
+	ctx.Clock = clock
+	ctx.DB = client.NewKV(nil, sender)
+	ctx.DB.User = storage.UserRoot
+	ctx.Transport = multiraft.NewLocalRPCTransport()
 	// TODO(bdarnell): arrange to have the transport closed.
-	store := storage.NewStore(clock, eng, db, g, multiraft.NewLocalRPCTransport(),
-		storage.TestStoreConfig)
+	store := storage.NewStore(*ctx, eng, &proto.NodeDescriptor{NodeID: 1})
 	if bootstrap {
 		if err := store.Bootstrap(proto.StoreIdent{NodeID: 1, StoreID: 1}, stopper); err != nil {
 			t.Fatal(err)
@@ -87,18 +97,36 @@ func createTestStoreWithEngine(t *testing.T, eng engine.Engine, clock *hlc.Clock
 }
 
 type multiTestContext struct {
+	t           *testing.T
 	manualClock *hlc.ManualClock
 	clock       *hlc.Clock
 	gossip      *gossip.Gossip
-	sender      *kv.LocalSender
 	transport   multiraft.Transport
 	db          *client.KV
+	feed        *util.Feed
 	engines     []engine.Engine
+	senders     []*kv.LocalSender
 	stores      []*storage.Store
-	stopper     *util.Stopper
+	idents      []proto.StoreIdent
+	// We use multiple stoppers so we can restart different parts of the
+	// test individually. clientStopper is for 'db', transportStopper is
+	// for 'transport', and the 'stoppers' slice corresponds to the
+	// 'stores'.
+	clientStopper    *util.Stopper
+	stoppers         []*util.Stopper
+	transportStopper *util.Stopper
+}
+
+// startMultiTestContext is a convenience function to create, start, and return
+// a multiTestContext.
+func startMultiTestContext(t *testing.T, numStores int) *multiTestContext {
+	m := &multiTestContext{}
+	m.Start(t, numStores)
+	return m
 }
 
 func (m *multiTestContext) Start(t *testing.T, numStores int) {
+	m.t = t
 	if m.manualClock == nil {
 		m.manualClock = hlc.NewManualClock(0)
 	}
@@ -106,20 +134,22 @@ func (m *multiTestContext) Start(t *testing.T, numStores int) {
 		m.clock = hlc.NewClock(m.manualClock.UnixNano)
 	}
 	if m.gossip == nil {
-		rpcContext := rpc.NewContext(m.clock, rpc.LoadInsecureTLSConfig())
+		rpcContext := rpc.NewContext(m.clock, security.LoadInsecureTLSConfig(), nil)
 		m.gossip = gossip.New(rpcContext, gossip.TestInterval, gossip.TestBootstrap)
 	}
 	if m.transport == nil {
 		m.transport = multiraft.NewLocalRPCTransport()
 	}
-	if m.sender == nil {
-		m.sender = kv.NewLocalSender()
+
+	if m.clientStopper == nil {
+		m.clientStopper = util.NewStopper()
 	}
-	if m.stopper == nil {
-		m.stopper = util.NewStopper()
-	}
+
+	// Always create the first sender.
+	m.senders = append(m.senders, kv.NewLocalSender())
+
 	if m.db == nil {
-		txnSender := kv.NewTxnCoordSender(m.sender, m.clock, false, m.stopper)
+		txnSender := kv.NewTxnCoordSender(m.senders[0], m.clock, false, m.clientStopper)
 		m.db = client.NewKV(nil, txnSender)
 		m.db.User = storage.UserRoot
 	}
@@ -127,11 +157,32 @@ func (m *multiTestContext) Start(t *testing.T, numStores int) {
 	for i := 0; i < numStores; i++ {
 		m.addStore(t)
 	}
-	m.stopper.AddCloser(m.transport)
+	if m.transportStopper == nil {
+		m.transportStopper = util.NewStopper()
+	}
+	m.transportStopper.AddCloser(m.transport)
 }
 
 func (m *multiTestContext) Stop() {
-	m.stopper.Stop()
+	m.clientStopper.Stop()
+	for _, s := range m.stoppers {
+		s.Stop()
+	}
+	m.transportStopper.Stop()
+	// Remove the extra engine refcounts.
+	for _, e := range m.engines {
+		e.Close()
+	}
+}
+
+func (m *multiTestContext) makeContext() storage.StoreContext {
+	ctx := storage.TestStoreContext
+	ctx.Clock = m.clock
+	ctx.DB = m.db
+	ctx.Gossip = m.gossip
+	ctx.Transport = m.transport
+	ctx.EventFeed = m.feed
+	return ctx
 }
 
 // AddStore creates a new store on the same Transport but doesn't create any ranges.
@@ -145,14 +196,22 @@ func (m *multiTestContext) addStore(t *testing.T) {
 		eng = engine.NewInMem(proto.Attributes{}, 1<<20)
 		m.engines = append(m.engines, eng)
 		needBootstrap = true
+		// Add an extra refcount to the engine so the underlying rocksdb instances
+		// aren't closed when stopping and restarting the stores.
+		// These refcounts are removed in Stop().
+		if err := eng.Open(); err != nil {
+			t.Fatal(err)
+		}
 	}
 
-	store := storage.NewStore(m.clock, eng, m.db, m.gossip, m.transport, storage.TestStoreConfig)
+	stopper := util.NewStopper()
+	ctx := m.makeContext()
+	store := storage.NewStore(ctx, eng, &proto.NodeDescriptor{NodeID: proto.NodeID(idx + 1)})
 	if needBootstrap {
 		err := store.Bootstrap(proto.StoreIdent{
 			NodeID:  proto.NodeID(idx + 1),
 			StoreID: proto.StoreID(idx + 1),
-		}, m.stopper)
+		}, stopper)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -164,35 +223,102 @@ func (m *multiTestContext) addStore(t *testing.T) {
 			}
 		}
 	}
-	if err := store.Start(m.stopper); err != nil {
+	if err := store.Start(stopper); err != nil {
 		t.Fatal(err)
 	}
 	m.stores = append(m.stores, store)
-	m.sender.AddStore(store)
+	if len(m.senders) == idx {
+		m.senders = append(m.senders, kv.NewLocalSender())
+	}
+	m.senders[idx].AddStore(store)
+	// Save the store identities for later so we can use them in
+	// replication operations even while the store is stopped.
+	m.idents = append(m.idents, store.Ident)
+	m.stoppers = append(m.stoppers, stopper)
 }
 
-// Restart stops and restarts all stores but leaves the engines intact,
+// StopStore stops a store but leaves the engine intact.
+// All stopped stores must be restarted before multiTestContext.Stop is called.
+func (m *multiTestContext) stopStore(i int) {
+	m.senders[i].RemoveStore(m.stores[i])
+	m.stoppers[i].Stop()
+	m.stoppers[i] = nil
+	m.stores[i] = nil
+}
+
+// restartStore restarts a store previously stopped with StopStore.
+func (m *multiTestContext) restartStore(i int) {
+	m.stoppers[i] = util.NewStopper()
+
+	ctx := m.makeContext()
+	m.stores[i] = storage.NewStore(ctx, m.engines[i], &proto.NodeDescriptor{NodeID: proto.NodeID(i + 1)})
+	if err := m.stores[i].Start(m.stoppers[i]); err != nil {
+		m.t.Fatal(err)
+	}
+	// The sender is assumed to still exist.
+	m.senders[i].AddStore(m.stores[i])
+}
+
+// restart stops and restarts all stores but leaves the engines intact,
 // so the stores should contain the same persistent storage as before.
-func (m *multiTestContext) Restart(t *testing.T) {
-	// Add extra ref counts to engines so the underlying rocksdb instances
-	// aren't closed when stopping and restarting the stores.
-	for _, e := range m.engines {
-		if err := e.Open(); err != nil {
-			t.Fatal(err)
+func (m *multiTestContext) restart() {
+	for i := range m.stores {
+		m.stopStore(i)
+	}
+	for i := range m.stores {
+		m.restartStore(i)
+	}
+}
+
+// replicateRange replicates the given range onto the given stores.
+func (m *multiTestContext) replicateRange(raftID int64, sourceStoreIndex int, dests ...int) {
+	rng, err := m.stores[sourceStoreIndex].GetRange(raftID)
+	if err != nil {
+		m.t.Fatal(err)
+	}
+
+	for _, dest := range dests {
+		err = rng.ChangeReplicas(proto.ADD_REPLICA,
+			proto.Replica{
+				NodeID:  m.stores[dest].Ident.NodeID,
+				StoreID: m.stores[dest].Ident.StoreID,
+			})
+		if err != nil {
+			m.t.Fatal(err)
 		}
 	}
-	nanos := m.manualClock.UnixNano() + 1
-	engines := m.engines
-	m.Stop()
-	*m = multiTestContext{
-		manualClock: hlc.NewManualClock(nanos),
-		engines:     engines,
+
+	// Wait for the replication to complete on all destination nodes.
+	util.SucceedsWithin(m.t, time.Second, func() error {
+		for _, dest := range dests {
+			// Use LookupRange(keys) instead of GetRange(raftID) to ensure that the
+			// snaphost has been transferred and the descriptor initialized.
+			if m.stores[dest].LookupRange(rng.Desc().StartKey, rng.Desc().StartKey) == nil {
+				return util.Errorf("range not found on store %d", dest)
+			}
+		}
+		return nil
+	})
+}
+
+func (m *multiTestContext) unreplicateRange(raftID int64, source, dest int) {
+	rng, err := m.stores[source].GetRange(raftID)
+	if err != nil {
+		m.t.Fatal(err)
 	}
-	m.Start(t, len(engines))
-	// Remove extra ref counts.
-	for _, e := range m.engines {
-		e.Close()
+
+	err = rng.ChangeReplicas(proto.REMOVE_REPLICA,
+		proto.Replica{
+			NodeID:  m.idents[dest].NodeID,
+			StoreID: m.idents[dest].StoreID,
+		})
+	if err != nil {
+		m.t.Fatal(err)
 	}
+
+	// Removing a range doesn't have any immediately-visible side
+	// effects, (and the removed node may be stopped) so return as soon
+	// as the removal has committed on the leader.
 }
 
 // getArgs returns a GetRequest and GetResponse pair addressed to
@@ -337,16 +463,21 @@ func TestUpdateRangeAddressing(t *testing.T) {
 	for i, test := range testCases {
 		left := &proto.RangeDescriptor{RaftID: int64(i * 2), StartKey: test.leftStart, EndKey: test.leftEnd}
 		right := &proto.RangeDescriptor{RaftID: int64(i*2 + 1), StartKey: test.rightStart, EndKey: test.rightEnd}
+		var calls []client.Call
 		if test.split {
-			if err := storage.SplitRangeAddressing(store.DB(), left, right); err != nil {
+			var err error
+			if calls, err = storage.SplitRangeAddressing(left, right); err != nil {
 				t.Fatal(err)
 			}
 		} else {
-			if err := storage.MergeRangeAddressing(store.DB(), left, right); err != nil {
+			var err error
+			if calls, err = storage.MergeRangeAddressing(left, right); err != nil {
 				t.Fatal(err)
 			}
 		}
-		store.DB().Flush()
+		if err := store.DB().Run(calls...); err != nil {
+			t.Fatal(err)
+		}
 		// Scan meta keys directly from engine.
 		kvs, err := engine.MVCCScan(store.Engine(), engine.KeyMetaPrefix, engine.KeyMetaMax, 0, proto.MaxTimestamp, true, nil)
 		if err != nil {
@@ -417,11 +548,9 @@ func TestUpdateRangeAddressing(t *testing.T) {
 // of meta1 records.
 func TestUpdateRangeAddressingSplitMeta1(t *testing.T) {
 	defer leaktest.AfterTest(t)
-	store, stopper := createTestStore(t)
-	defer stopper.Stop()
 	left := &proto.RangeDescriptor{StartKey: engine.KeyMin, EndKey: meta1Key(proto.Key("a"))}
 	right := &proto.RangeDescriptor{StartKey: meta1Key(proto.Key("a")), EndKey: engine.KeyMax}
-	if err := storage.SplitRangeAddressing(store.DB(), left, right); err == nil {
+	if _, err := storage.SplitRangeAddressing(left, right); err == nil {
 		t.Error("expected failure trying to update addressing records for meta1 split")
 	}
 }

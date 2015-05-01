@@ -54,6 +54,7 @@ class MVCCMetadata;
 class GCMetadata;
 class TimeSeriesDatapoint;
 class TimeSeriesData;
+class MVCCStats;
 
 enum ReplicaChangeType {
   ADD_REPLICA = 0,
@@ -1493,42 +1494,37 @@ class Lease : public ::google::protobuf::Message {
 
   // accessors -------------------------------------------------------
 
-  // optional int64 expiration = 1;
+  // optional .cockroach.proto.Timestamp start = 1;
+  inline bool has_start() const;
+  inline void clear_start();
+  static const int kStartFieldNumber = 1;
+  inline const ::cockroach::proto::Timestamp& start() const;
+  inline ::cockroach::proto::Timestamp* mutable_start();
+  inline ::cockroach::proto::Timestamp* release_start();
+  inline void set_allocated_start(::cockroach::proto::Timestamp* start);
+
+  // optional .cockroach.proto.Timestamp expiration = 2;
   inline bool has_expiration() const;
   inline void clear_expiration();
-  static const int kExpirationFieldNumber = 1;
-  inline ::google::protobuf::int64 expiration() const;
-  inline void set_expiration(::google::protobuf::int64 value);
+  static const int kExpirationFieldNumber = 2;
+  inline const ::cockroach::proto::Timestamp& expiration() const;
+  inline ::cockroach::proto::Timestamp* mutable_expiration();
+  inline ::cockroach::proto::Timestamp* release_expiration();
+  inline void set_allocated_expiration(::cockroach::proto::Timestamp* expiration);
 
-  // optional int64 duration = 2;
-  inline bool has_duration() const;
-  inline void clear_duration();
-  static const int kDurationFieldNumber = 2;
-  inline ::google::protobuf::int64 duration() const;
-  inline void set_duration(::google::protobuf::int64 value);
-
-  // optional uint64 term = 3;
-  inline bool has_term() const;
-  inline void clear_term();
-  static const int kTermFieldNumber = 3;
-  inline ::google::protobuf::uint64 term() const;
-  inline void set_term(::google::protobuf::uint64 value);
-
-  // optional uint64 raft_node_id = 4;
+  // optional uint64 raft_node_id = 3;
   inline bool has_raft_node_id() const;
   inline void clear_raft_node_id();
-  static const int kRaftNodeIdFieldNumber = 4;
+  static const int kRaftNodeIdFieldNumber = 3;
   inline ::google::protobuf::uint64 raft_node_id() const;
   inline void set_raft_node_id(::google::protobuf::uint64 value);
 
   // @@protoc_insertion_point(class_scope:cockroach.proto.Lease)
  private:
+  inline void set_has_start();
+  inline void clear_has_start();
   inline void set_has_expiration();
   inline void clear_has_expiration();
-  inline void set_has_duration();
-  inline void clear_has_duration();
-  inline void set_has_term();
-  inline void clear_has_term();
   inline void set_has_raft_node_id();
   inline void clear_has_raft_node_id();
 
@@ -1536,9 +1532,8 @@ class Lease : public ::google::protobuf::Message {
 
   ::google::protobuf::uint32 _has_bits_[1];
   mutable int _cached_size_;
-  ::google::protobuf::int64 expiration_;
-  ::google::protobuf::int64 duration_;
-  ::google::protobuf::uint64 term_;
+  ::cockroach::proto::Timestamp* start_;
+  ::cockroach::proto::Timestamp* expiration_;
   ::google::protobuf::uint64 raft_node_id_;
   friend void  protobuf_AddDesc_cockroach_2fproto_2fdata_2eproto();
   friend void protobuf_AssignDesc_cockroach_2fproto_2fdata_2eproto();
@@ -1981,6 +1976,185 @@ class TimeSeriesData : public ::google::protobuf::Message {
 
   void InitAsDefaultInstance();
   static TimeSeriesData* default_instance_;
+};
+// -------------------------------------------------------------------
+
+class MVCCStats : public ::google::protobuf::Message {
+ public:
+  MVCCStats();
+  virtual ~MVCCStats();
+
+  MVCCStats(const MVCCStats& from);
+
+  inline MVCCStats& operator=(const MVCCStats& from) {
+    CopyFrom(from);
+    return *this;
+  }
+
+  inline const ::google::protobuf::UnknownFieldSet& unknown_fields() const {
+    return _unknown_fields_;
+  }
+
+  inline ::google::protobuf::UnknownFieldSet* mutable_unknown_fields() {
+    return &_unknown_fields_;
+  }
+
+  static const ::google::protobuf::Descriptor* descriptor();
+  static const MVCCStats& default_instance();
+
+  void Swap(MVCCStats* other);
+
+  // implements Message ----------------------------------------------
+
+  MVCCStats* New() const;
+  void CopyFrom(const ::google::protobuf::Message& from);
+  void MergeFrom(const ::google::protobuf::Message& from);
+  void CopyFrom(const MVCCStats& from);
+  void MergeFrom(const MVCCStats& from);
+  void Clear();
+  bool IsInitialized() const;
+
+  int ByteSize() const;
+  bool MergePartialFromCodedStream(
+      ::google::protobuf::io::CodedInputStream* input);
+  void SerializeWithCachedSizes(
+      ::google::protobuf::io::CodedOutputStream* output) const;
+  ::google::protobuf::uint8* SerializeWithCachedSizesToArray(::google::protobuf::uint8* output) const;
+  int GetCachedSize() const { return _cached_size_; }
+  private:
+  void SharedCtor();
+  void SharedDtor();
+  void SetCachedSize(int size) const;
+  public:
+  ::google::protobuf::Metadata GetMetadata() const;
+
+  // nested types ----------------------------------------------------
+
+  // accessors -------------------------------------------------------
+
+  // optional int64 live_bytes = 1;
+  inline bool has_live_bytes() const;
+  inline void clear_live_bytes();
+  static const int kLiveBytesFieldNumber = 1;
+  inline ::google::protobuf::int64 live_bytes() const;
+  inline void set_live_bytes(::google::protobuf::int64 value);
+
+  // optional int64 key_bytes = 2;
+  inline bool has_key_bytes() const;
+  inline void clear_key_bytes();
+  static const int kKeyBytesFieldNumber = 2;
+  inline ::google::protobuf::int64 key_bytes() const;
+  inline void set_key_bytes(::google::protobuf::int64 value);
+
+  // optional int64 val_bytes = 3;
+  inline bool has_val_bytes() const;
+  inline void clear_val_bytes();
+  static const int kValBytesFieldNumber = 3;
+  inline ::google::protobuf::int64 val_bytes() const;
+  inline void set_val_bytes(::google::protobuf::int64 value);
+
+  // optional int64 intent_bytes = 4;
+  inline bool has_intent_bytes() const;
+  inline void clear_intent_bytes();
+  static const int kIntentBytesFieldNumber = 4;
+  inline ::google::protobuf::int64 intent_bytes() const;
+  inline void set_intent_bytes(::google::protobuf::int64 value);
+
+  // optional int64 live_count = 5;
+  inline bool has_live_count() const;
+  inline void clear_live_count();
+  static const int kLiveCountFieldNumber = 5;
+  inline ::google::protobuf::int64 live_count() const;
+  inline void set_live_count(::google::protobuf::int64 value);
+
+  // optional int64 key_count = 6;
+  inline bool has_key_count() const;
+  inline void clear_key_count();
+  static const int kKeyCountFieldNumber = 6;
+  inline ::google::protobuf::int64 key_count() const;
+  inline void set_key_count(::google::protobuf::int64 value);
+
+  // optional int64 val_count = 7;
+  inline bool has_val_count() const;
+  inline void clear_val_count();
+  static const int kValCountFieldNumber = 7;
+  inline ::google::protobuf::int64 val_count() const;
+  inline void set_val_count(::google::protobuf::int64 value);
+
+  // optional int64 intent_count = 8;
+  inline bool has_intent_count() const;
+  inline void clear_intent_count();
+  static const int kIntentCountFieldNumber = 8;
+  inline ::google::protobuf::int64 intent_count() const;
+  inline void set_intent_count(::google::protobuf::int64 value);
+
+  // optional int64 intent_age = 9;
+  inline bool has_intent_age() const;
+  inline void clear_intent_age();
+  static const int kIntentAgeFieldNumber = 9;
+  inline ::google::protobuf::int64 intent_age() const;
+  inline void set_intent_age(::google::protobuf::int64 value);
+
+  // optional int64 gc_bytes_age = 10;
+  inline bool has_gc_bytes_age() const;
+  inline void clear_gc_bytes_age();
+  static const int kGcBytesAgeFieldNumber = 10;
+  inline ::google::protobuf::int64 gc_bytes_age() const;
+  inline void set_gc_bytes_age(::google::protobuf::int64 value);
+
+  // optional int64 last_update_nanos = 11;
+  inline bool has_last_update_nanos() const;
+  inline void clear_last_update_nanos();
+  static const int kLastUpdateNanosFieldNumber = 11;
+  inline ::google::protobuf::int64 last_update_nanos() const;
+  inline void set_last_update_nanos(::google::protobuf::int64 value);
+
+  // @@protoc_insertion_point(class_scope:cockroach.proto.MVCCStats)
+ private:
+  inline void set_has_live_bytes();
+  inline void clear_has_live_bytes();
+  inline void set_has_key_bytes();
+  inline void clear_has_key_bytes();
+  inline void set_has_val_bytes();
+  inline void clear_has_val_bytes();
+  inline void set_has_intent_bytes();
+  inline void clear_has_intent_bytes();
+  inline void set_has_live_count();
+  inline void clear_has_live_count();
+  inline void set_has_key_count();
+  inline void clear_has_key_count();
+  inline void set_has_val_count();
+  inline void clear_has_val_count();
+  inline void set_has_intent_count();
+  inline void clear_has_intent_count();
+  inline void set_has_intent_age();
+  inline void clear_has_intent_age();
+  inline void set_has_gc_bytes_age();
+  inline void clear_has_gc_bytes_age();
+  inline void set_has_last_update_nanos();
+  inline void clear_has_last_update_nanos();
+
+  ::google::protobuf::UnknownFieldSet _unknown_fields_;
+
+  ::google::protobuf::uint32 _has_bits_[1];
+  mutable int _cached_size_;
+  ::google::protobuf::int64 live_bytes_;
+  ::google::protobuf::int64 key_bytes_;
+  ::google::protobuf::int64 val_bytes_;
+  ::google::protobuf::int64 intent_bytes_;
+  ::google::protobuf::int64 live_count_;
+  ::google::protobuf::int64 key_count_;
+  ::google::protobuf::int64 val_count_;
+  ::google::protobuf::int64 intent_count_;
+  ::google::protobuf::int64 intent_age_;
+  ::google::protobuf::int64 gc_bytes_age_;
+  ::google::protobuf::int64 last_update_nanos_;
+  friend void  protobuf_AddDesc_cockroach_2fproto_2fdata_2eproto();
+  friend void protobuf_AssignDesc_cockroach_2fproto_2fdata_2eproto();
+  friend void protobuf_ShutdownFile_cockroach_2fproto_2fdata_2eproto();
+
+  void InitAsDefaultInstance();
+  static MVCCStats* default_instance_;
 };
 // ===================================================================
 
@@ -3772,87 +3946,97 @@ inline void Transaction::set_allocated_certain_nodes(::cockroach::proto::NodeLis
 
 // Lease
 
-// optional int64 expiration = 1;
-inline bool Lease::has_expiration() const {
+// optional .cockroach.proto.Timestamp start = 1;
+inline bool Lease::has_start() const {
   return (_has_bits_[0] & 0x00000001u) != 0;
 }
-inline void Lease::set_has_expiration() {
+inline void Lease::set_has_start() {
   _has_bits_[0] |= 0x00000001u;
 }
-inline void Lease::clear_has_expiration() {
+inline void Lease::clear_has_start() {
   _has_bits_[0] &= ~0x00000001u;
 }
-inline void Lease::clear_expiration() {
-  expiration_ = GOOGLE_LONGLONG(0);
-  clear_has_expiration();
+inline void Lease::clear_start() {
+  if (start_ != NULL) start_->::cockroach::proto::Timestamp::Clear();
+  clear_has_start();
 }
-inline ::google::protobuf::int64 Lease::expiration() const {
-  // @@protoc_insertion_point(field_get:cockroach.proto.Lease.expiration)
-  return expiration_;
+inline const ::cockroach::proto::Timestamp& Lease::start() const {
+  // @@protoc_insertion_point(field_get:cockroach.proto.Lease.start)
+  return start_ != NULL ? *start_ : *default_instance_->start_;
 }
-inline void Lease::set_expiration(::google::protobuf::int64 value) {
-  set_has_expiration();
-  expiration_ = value;
-  // @@protoc_insertion_point(field_set:cockroach.proto.Lease.expiration)
+inline ::cockroach::proto::Timestamp* Lease::mutable_start() {
+  set_has_start();
+  if (start_ == NULL) start_ = new ::cockroach::proto::Timestamp;
+  // @@protoc_insertion_point(field_mutable:cockroach.proto.Lease.start)
+  return start_;
+}
+inline ::cockroach::proto::Timestamp* Lease::release_start() {
+  clear_has_start();
+  ::cockroach::proto::Timestamp* temp = start_;
+  start_ = NULL;
+  return temp;
+}
+inline void Lease::set_allocated_start(::cockroach::proto::Timestamp* start) {
+  delete start_;
+  start_ = start;
+  if (start) {
+    set_has_start();
+  } else {
+    clear_has_start();
+  }
+  // @@protoc_insertion_point(field_set_allocated:cockroach.proto.Lease.start)
 }
 
-// optional int64 duration = 2;
-inline bool Lease::has_duration() const {
+// optional .cockroach.proto.Timestamp expiration = 2;
+inline bool Lease::has_expiration() const {
   return (_has_bits_[0] & 0x00000002u) != 0;
 }
-inline void Lease::set_has_duration() {
+inline void Lease::set_has_expiration() {
   _has_bits_[0] |= 0x00000002u;
 }
-inline void Lease::clear_has_duration() {
+inline void Lease::clear_has_expiration() {
   _has_bits_[0] &= ~0x00000002u;
 }
-inline void Lease::clear_duration() {
-  duration_ = GOOGLE_LONGLONG(0);
-  clear_has_duration();
+inline void Lease::clear_expiration() {
+  if (expiration_ != NULL) expiration_->::cockroach::proto::Timestamp::Clear();
+  clear_has_expiration();
 }
-inline ::google::protobuf::int64 Lease::duration() const {
-  // @@protoc_insertion_point(field_get:cockroach.proto.Lease.duration)
-  return duration_;
+inline const ::cockroach::proto::Timestamp& Lease::expiration() const {
+  // @@protoc_insertion_point(field_get:cockroach.proto.Lease.expiration)
+  return expiration_ != NULL ? *expiration_ : *default_instance_->expiration_;
 }
-inline void Lease::set_duration(::google::protobuf::int64 value) {
-  set_has_duration();
-  duration_ = value;
-  // @@protoc_insertion_point(field_set:cockroach.proto.Lease.duration)
+inline ::cockroach::proto::Timestamp* Lease::mutable_expiration() {
+  set_has_expiration();
+  if (expiration_ == NULL) expiration_ = new ::cockroach::proto::Timestamp;
+  // @@protoc_insertion_point(field_mutable:cockroach.proto.Lease.expiration)
+  return expiration_;
+}
+inline ::cockroach::proto::Timestamp* Lease::release_expiration() {
+  clear_has_expiration();
+  ::cockroach::proto::Timestamp* temp = expiration_;
+  expiration_ = NULL;
+  return temp;
+}
+inline void Lease::set_allocated_expiration(::cockroach::proto::Timestamp* expiration) {
+  delete expiration_;
+  expiration_ = expiration;
+  if (expiration) {
+    set_has_expiration();
+  } else {
+    clear_has_expiration();
+  }
+  // @@protoc_insertion_point(field_set_allocated:cockroach.proto.Lease.expiration)
 }
 
-// optional uint64 term = 3;
-inline bool Lease::has_term() const {
+// optional uint64 raft_node_id = 3;
+inline bool Lease::has_raft_node_id() const {
   return (_has_bits_[0] & 0x00000004u) != 0;
 }
-inline void Lease::set_has_term() {
+inline void Lease::set_has_raft_node_id() {
   _has_bits_[0] |= 0x00000004u;
 }
-inline void Lease::clear_has_term() {
-  _has_bits_[0] &= ~0x00000004u;
-}
-inline void Lease::clear_term() {
-  term_ = GOOGLE_ULONGLONG(0);
-  clear_has_term();
-}
-inline ::google::protobuf::uint64 Lease::term() const {
-  // @@protoc_insertion_point(field_get:cockroach.proto.Lease.term)
-  return term_;
-}
-inline void Lease::set_term(::google::protobuf::uint64 value) {
-  set_has_term();
-  term_ = value;
-  // @@protoc_insertion_point(field_set:cockroach.proto.Lease.term)
-}
-
-// optional uint64 raft_node_id = 4;
-inline bool Lease::has_raft_node_id() const {
-  return (_has_bits_[0] & 0x00000008u) != 0;
-}
-inline void Lease::set_has_raft_node_id() {
-  _has_bits_[0] |= 0x00000008u;
-}
 inline void Lease::clear_has_raft_node_id() {
-  _has_bits_[0] &= ~0x00000008u;
+  _has_bits_[0] &= ~0x00000004u;
 }
 inline void Lease::clear_raft_node_id() {
   raft_node_id_ = GOOGLE_ULONGLONG(0);
@@ -4379,6 +4563,274 @@ inline ::google::protobuf::RepeatedPtrField< ::cockroach::proto::TimeSeriesDatap
 TimeSeriesData::mutable_datapoints() {
   // @@protoc_insertion_point(field_mutable_list:cockroach.proto.TimeSeriesData.datapoints)
   return &datapoints_;
+}
+
+// -------------------------------------------------------------------
+
+// MVCCStats
+
+// optional int64 live_bytes = 1;
+inline bool MVCCStats::has_live_bytes() const {
+  return (_has_bits_[0] & 0x00000001u) != 0;
+}
+inline void MVCCStats::set_has_live_bytes() {
+  _has_bits_[0] |= 0x00000001u;
+}
+inline void MVCCStats::clear_has_live_bytes() {
+  _has_bits_[0] &= ~0x00000001u;
+}
+inline void MVCCStats::clear_live_bytes() {
+  live_bytes_ = GOOGLE_LONGLONG(0);
+  clear_has_live_bytes();
+}
+inline ::google::protobuf::int64 MVCCStats::live_bytes() const {
+  // @@protoc_insertion_point(field_get:cockroach.proto.MVCCStats.live_bytes)
+  return live_bytes_;
+}
+inline void MVCCStats::set_live_bytes(::google::protobuf::int64 value) {
+  set_has_live_bytes();
+  live_bytes_ = value;
+  // @@protoc_insertion_point(field_set:cockroach.proto.MVCCStats.live_bytes)
+}
+
+// optional int64 key_bytes = 2;
+inline bool MVCCStats::has_key_bytes() const {
+  return (_has_bits_[0] & 0x00000002u) != 0;
+}
+inline void MVCCStats::set_has_key_bytes() {
+  _has_bits_[0] |= 0x00000002u;
+}
+inline void MVCCStats::clear_has_key_bytes() {
+  _has_bits_[0] &= ~0x00000002u;
+}
+inline void MVCCStats::clear_key_bytes() {
+  key_bytes_ = GOOGLE_LONGLONG(0);
+  clear_has_key_bytes();
+}
+inline ::google::protobuf::int64 MVCCStats::key_bytes() const {
+  // @@protoc_insertion_point(field_get:cockroach.proto.MVCCStats.key_bytes)
+  return key_bytes_;
+}
+inline void MVCCStats::set_key_bytes(::google::protobuf::int64 value) {
+  set_has_key_bytes();
+  key_bytes_ = value;
+  // @@protoc_insertion_point(field_set:cockroach.proto.MVCCStats.key_bytes)
+}
+
+// optional int64 val_bytes = 3;
+inline bool MVCCStats::has_val_bytes() const {
+  return (_has_bits_[0] & 0x00000004u) != 0;
+}
+inline void MVCCStats::set_has_val_bytes() {
+  _has_bits_[0] |= 0x00000004u;
+}
+inline void MVCCStats::clear_has_val_bytes() {
+  _has_bits_[0] &= ~0x00000004u;
+}
+inline void MVCCStats::clear_val_bytes() {
+  val_bytes_ = GOOGLE_LONGLONG(0);
+  clear_has_val_bytes();
+}
+inline ::google::protobuf::int64 MVCCStats::val_bytes() const {
+  // @@protoc_insertion_point(field_get:cockroach.proto.MVCCStats.val_bytes)
+  return val_bytes_;
+}
+inline void MVCCStats::set_val_bytes(::google::protobuf::int64 value) {
+  set_has_val_bytes();
+  val_bytes_ = value;
+  // @@protoc_insertion_point(field_set:cockroach.proto.MVCCStats.val_bytes)
+}
+
+// optional int64 intent_bytes = 4;
+inline bool MVCCStats::has_intent_bytes() const {
+  return (_has_bits_[0] & 0x00000008u) != 0;
+}
+inline void MVCCStats::set_has_intent_bytes() {
+  _has_bits_[0] |= 0x00000008u;
+}
+inline void MVCCStats::clear_has_intent_bytes() {
+  _has_bits_[0] &= ~0x00000008u;
+}
+inline void MVCCStats::clear_intent_bytes() {
+  intent_bytes_ = GOOGLE_LONGLONG(0);
+  clear_has_intent_bytes();
+}
+inline ::google::protobuf::int64 MVCCStats::intent_bytes() const {
+  // @@protoc_insertion_point(field_get:cockroach.proto.MVCCStats.intent_bytes)
+  return intent_bytes_;
+}
+inline void MVCCStats::set_intent_bytes(::google::protobuf::int64 value) {
+  set_has_intent_bytes();
+  intent_bytes_ = value;
+  // @@protoc_insertion_point(field_set:cockroach.proto.MVCCStats.intent_bytes)
+}
+
+// optional int64 live_count = 5;
+inline bool MVCCStats::has_live_count() const {
+  return (_has_bits_[0] & 0x00000010u) != 0;
+}
+inline void MVCCStats::set_has_live_count() {
+  _has_bits_[0] |= 0x00000010u;
+}
+inline void MVCCStats::clear_has_live_count() {
+  _has_bits_[0] &= ~0x00000010u;
+}
+inline void MVCCStats::clear_live_count() {
+  live_count_ = GOOGLE_LONGLONG(0);
+  clear_has_live_count();
+}
+inline ::google::protobuf::int64 MVCCStats::live_count() const {
+  // @@protoc_insertion_point(field_get:cockroach.proto.MVCCStats.live_count)
+  return live_count_;
+}
+inline void MVCCStats::set_live_count(::google::protobuf::int64 value) {
+  set_has_live_count();
+  live_count_ = value;
+  // @@protoc_insertion_point(field_set:cockroach.proto.MVCCStats.live_count)
+}
+
+// optional int64 key_count = 6;
+inline bool MVCCStats::has_key_count() const {
+  return (_has_bits_[0] & 0x00000020u) != 0;
+}
+inline void MVCCStats::set_has_key_count() {
+  _has_bits_[0] |= 0x00000020u;
+}
+inline void MVCCStats::clear_has_key_count() {
+  _has_bits_[0] &= ~0x00000020u;
+}
+inline void MVCCStats::clear_key_count() {
+  key_count_ = GOOGLE_LONGLONG(0);
+  clear_has_key_count();
+}
+inline ::google::protobuf::int64 MVCCStats::key_count() const {
+  // @@protoc_insertion_point(field_get:cockroach.proto.MVCCStats.key_count)
+  return key_count_;
+}
+inline void MVCCStats::set_key_count(::google::protobuf::int64 value) {
+  set_has_key_count();
+  key_count_ = value;
+  // @@protoc_insertion_point(field_set:cockroach.proto.MVCCStats.key_count)
+}
+
+// optional int64 val_count = 7;
+inline bool MVCCStats::has_val_count() const {
+  return (_has_bits_[0] & 0x00000040u) != 0;
+}
+inline void MVCCStats::set_has_val_count() {
+  _has_bits_[0] |= 0x00000040u;
+}
+inline void MVCCStats::clear_has_val_count() {
+  _has_bits_[0] &= ~0x00000040u;
+}
+inline void MVCCStats::clear_val_count() {
+  val_count_ = GOOGLE_LONGLONG(0);
+  clear_has_val_count();
+}
+inline ::google::protobuf::int64 MVCCStats::val_count() const {
+  // @@protoc_insertion_point(field_get:cockroach.proto.MVCCStats.val_count)
+  return val_count_;
+}
+inline void MVCCStats::set_val_count(::google::protobuf::int64 value) {
+  set_has_val_count();
+  val_count_ = value;
+  // @@protoc_insertion_point(field_set:cockroach.proto.MVCCStats.val_count)
+}
+
+// optional int64 intent_count = 8;
+inline bool MVCCStats::has_intent_count() const {
+  return (_has_bits_[0] & 0x00000080u) != 0;
+}
+inline void MVCCStats::set_has_intent_count() {
+  _has_bits_[0] |= 0x00000080u;
+}
+inline void MVCCStats::clear_has_intent_count() {
+  _has_bits_[0] &= ~0x00000080u;
+}
+inline void MVCCStats::clear_intent_count() {
+  intent_count_ = GOOGLE_LONGLONG(0);
+  clear_has_intent_count();
+}
+inline ::google::protobuf::int64 MVCCStats::intent_count() const {
+  // @@protoc_insertion_point(field_get:cockroach.proto.MVCCStats.intent_count)
+  return intent_count_;
+}
+inline void MVCCStats::set_intent_count(::google::protobuf::int64 value) {
+  set_has_intent_count();
+  intent_count_ = value;
+  // @@protoc_insertion_point(field_set:cockroach.proto.MVCCStats.intent_count)
+}
+
+// optional int64 intent_age = 9;
+inline bool MVCCStats::has_intent_age() const {
+  return (_has_bits_[0] & 0x00000100u) != 0;
+}
+inline void MVCCStats::set_has_intent_age() {
+  _has_bits_[0] |= 0x00000100u;
+}
+inline void MVCCStats::clear_has_intent_age() {
+  _has_bits_[0] &= ~0x00000100u;
+}
+inline void MVCCStats::clear_intent_age() {
+  intent_age_ = GOOGLE_LONGLONG(0);
+  clear_has_intent_age();
+}
+inline ::google::protobuf::int64 MVCCStats::intent_age() const {
+  // @@protoc_insertion_point(field_get:cockroach.proto.MVCCStats.intent_age)
+  return intent_age_;
+}
+inline void MVCCStats::set_intent_age(::google::protobuf::int64 value) {
+  set_has_intent_age();
+  intent_age_ = value;
+  // @@protoc_insertion_point(field_set:cockroach.proto.MVCCStats.intent_age)
+}
+
+// optional int64 gc_bytes_age = 10;
+inline bool MVCCStats::has_gc_bytes_age() const {
+  return (_has_bits_[0] & 0x00000200u) != 0;
+}
+inline void MVCCStats::set_has_gc_bytes_age() {
+  _has_bits_[0] |= 0x00000200u;
+}
+inline void MVCCStats::clear_has_gc_bytes_age() {
+  _has_bits_[0] &= ~0x00000200u;
+}
+inline void MVCCStats::clear_gc_bytes_age() {
+  gc_bytes_age_ = GOOGLE_LONGLONG(0);
+  clear_has_gc_bytes_age();
+}
+inline ::google::protobuf::int64 MVCCStats::gc_bytes_age() const {
+  // @@protoc_insertion_point(field_get:cockroach.proto.MVCCStats.gc_bytes_age)
+  return gc_bytes_age_;
+}
+inline void MVCCStats::set_gc_bytes_age(::google::protobuf::int64 value) {
+  set_has_gc_bytes_age();
+  gc_bytes_age_ = value;
+  // @@protoc_insertion_point(field_set:cockroach.proto.MVCCStats.gc_bytes_age)
+}
+
+// optional int64 last_update_nanos = 11;
+inline bool MVCCStats::has_last_update_nanos() const {
+  return (_has_bits_[0] & 0x00000400u) != 0;
+}
+inline void MVCCStats::set_has_last_update_nanos() {
+  _has_bits_[0] |= 0x00000400u;
+}
+inline void MVCCStats::clear_has_last_update_nanos() {
+  _has_bits_[0] &= ~0x00000400u;
+}
+inline void MVCCStats::clear_last_update_nanos() {
+  last_update_nanos_ = GOOGLE_LONGLONG(0);
+  clear_has_last_update_nanos();
+}
+inline ::google::protobuf::int64 MVCCStats::last_update_nanos() const {
+  // @@protoc_insertion_point(field_get:cockroach.proto.MVCCStats.last_update_nanos)
+  return last_update_nanos_;
+}
+inline void MVCCStats::set_last_update_nanos(::google::protobuf::int64 value) {
+  set_has_last_update_nanos();
+  last_update_nanos_ = value;
+  // @@protoc_insertion_point(field_set:cockroach.proto.MVCCStats.last_update_nanos)
 }
 
 

@@ -26,24 +26,30 @@ import (
 	"github.com/cockroachdb/cockroach/client"
 	"github.com/cockroachdb/cockroach/kv"
 	"github.com/cockroachdb/cockroach/proto"
-	"github.com/cockroachdb/cockroach/rpc"
+	"github.com/cockroachdb/cockroach/storage"
+	"github.com/cockroachdb/cockroach/testutils"
 	"github.com/cockroachdb/cockroach/util"
 	gogoproto "github.com/gogo/protobuf/proto"
 	yaml "gopkg.in/yaml.v1"
 )
 
-func createTestClient(addr string) *client.KV {
-	transport := &http.Transport{TLSClientConfig: rpc.LoadInsecureTLSConfig().Config()}
-	return client.NewKV(nil, client.NewHTTPSender(addr, transport))
+func createTestClient(t *testing.T, addr string) *client.KV {
+	httpSender, err := client.NewHTTPSender(addr, testutils.NewTestBaseContext())
+	if err != nil {
+		t.Fatal(err)
+	}
+	context := client.NewContext()
+	context.User = storage.UserRoot
+	return client.NewKV(context, httpSender)
 }
 
 // TestKVDBCoverage verifies that all methods may be invoked on the
 // key value database.
 func TestKVDBCoverage(t *testing.T) {
-	addr, _, stopper := startServer(t)
-	defer stopper.Stop()
+	s := startServer(t)
+	defer s.Stop()
 
-	kvClient := createTestClient(addr)
+	kvClient := createTestClient(t, s.ServingAddr())
 	key := proto.Key("a")
 	value1 := []byte("value1")
 	value2 := []byte("value2")
@@ -53,7 +59,7 @@ func TestKVDBCoverage(t *testing.T) {
 	putReq := &proto.PutRequest{Value: proto.Value{Bytes: value1}}
 	putReq.Key = key
 	putResp := &proto.PutResponse{}
-	if err := kvClient.Call(proto.Put, putReq, putResp); err != nil || putResp.Error != nil {
+	if err := kvClient.Run(client.Call{Args: putReq, Reply: putResp}); err != nil || putResp.Error != nil {
 		t.Fatalf("%s, %s", err, putResp.GoError())
 	}
 
@@ -61,7 +67,7 @@ func TestKVDBCoverage(t *testing.T) {
 	containsReq := &proto.ContainsRequest{}
 	containsReq.Key = key
 	containsResp := &proto.ContainsResponse{}
-	if err := kvClient.Call(proto.Contains, containsReq, containsResp); err != nil || containsResp.Error != nil {
+	if err := kvClient.Run(client.Call{Args: containsReq, Reply: containsResp}); err != nil || containsResp.Error != nil {
 		t.Fatalf("%s, %s", err, containsResp.GoError())
 	}
 	if !containsResp.Exists {
@@ -75,7 +81,7 @@ func TestKVDBCoverage(t *testing.T) {
 	}
 	cPutReq.Key = key
 	cPutResp := &proto.ConditionalPutResponse{}
-	if err := kvClient.Call(proto.ConditionalPut, cPutReq, cPutResp); err != nil || cPutResp.Error != nil {
+	if err := kvClient.Run(client.Call{Args: cPutReq, Reply: cPutResp}); err != nil || cPutResp.Error != nil {
 		t.Fatalf("%s, %s", err, cPutResp.GoError())
 	}
 
@@ -83,7 +89,7 @@ func TestKVDBCoverage(t *testing.T) {
 	getReq := &proto.GetRequest{}
 	getReq.Key = key
 	getResp := &proto.GetResponse{}
-	if err := kvClient.Call(proto.Get, getReq, getResp); err != nil || getResp.Error != nil {
+	if err := kvClient.Run(client.Call{Args: getReq, Reply: getResp}); err != nil || getResp.Error != nil {
 		t.Fatalf("%s, %s", err, getResp.GoError())
 	}
 	if !bytes.Equal(getResp.Value.Bytes, value2) {
@@ -94,7 +100,7 @@ func TestKVDBCoverage(t *testing.T) {
 	incrReq := &proto.IncrementRequest{Increment: 10}
 	incrReq.Key = proto.Key("i")
 	incrResp := &proto.IncrementResponse{}
-	if err := kvClient.Call(proto.Increment, incrReq, incrResp); err != nil || incrResp.Error != nil {
+	if err := kvClient.Run(client.Call{Args: incrReq, Reply: incrResp}); err != nil || incrResp.Error != nil {
 		t.Fatalf("%s, %s", err, incrResp.GoError())
 	}
 	if incrResp.NewValue != incrReq.Increment {
@@ -105,10 +111,10 @@ func TestKVDBCoverage(t *testing.T) {
 	delReq := &proto.DeleteRequest{}
 	delReq.Key = key
 	delResp := &proto.DeleteResponse{}
-	if err := kvClient.Call(proto.Delete, delReq, delResp); err != nil || delResp.Error != nil {
+	if err := kvClient.Run(client.Call{Args: delReq, Reply: delResp}); err != nil || delResp.Error != nil {
 		t.Fatalf("%s, %s", err, delResp.GoError())
 	}
-	if err := kvClient.Call(proto.Contains, containsReq, containsResp); err != nil || containsResp.Error != nil {
+	if err := kvClient.Run(client.Call{Args: containsReq, Reply: containsResp}); err != nil || containsResp.Error != nil {
 		t.Fatalf("%s, %s", err, containsResp.GoError())
 	}
 	if containsResp.Exists {
@@ -123,7 +129,7 @@ func TestKVDBCoverage(t *testing.T) {
 	}
 	for _, kv := range keyValues {
 		putReq.Key, putReq.Value = kv.Key, kv.Value
-		if err := kvClient.Call(proto.Put, putReq, putResp); err != nil || putResp.Error != nil {
+		if err := kvClient.Run(client.Call{Args: putReq, Reply: putResp}); err != nil || putResp.Error != nil {
 			t.Fatalf("%s, %s", err, putResp.GoError())
 		}
 	}
@@ -131,7 +137,7 @@ func TestKVDBCoverage(t *testing.T) {
 	scanReq.Key = proto.Key("a")
 	scanReq.EndKey = proto.Key("c").Next()
 	scanResp := &proto.ScanResponse{}
-	if err := kvClient.Call(proto.Scan, scanReq, scanResp); err != nil || scanResp.Error != nil {
+	if err := kvClient.Run(client.Call{Args: scanReq, Reply: scanResp}); err != nil || scanResp.Error != nil {
 		t.Fatalf("%s, %s", err, scanResp.GoError())
 	}
 	if len(scanResp.Rows) != len(keyValues) {
@@ -147,7 +153,7 @@ func TestKVDBCoverage(t *testing.T) {
 	deleteRangeReq.Key = proto.Key("a")
 	deleteRangeReq.EndKey = proto.Key("c").Next()
 	deleteRangeResp := &proto.DeleteRangeResponse{}
-	if err := kvClient.Call(proto.DeleteRange, deleteRangeReq, deleteRangeResp); err != nil || deleteRangeResp.Error != nil {
+	if err := kvClient.Run(client.Call{Args: deleteRangeReq, Reply: deleteRangeResp}); err != nil || deleteRangeResp.Error != nil {
 		t.Fatalf("%s, %s", err, deleteRangeResp.GoError())
 	}
 	if deleteRangeResp.NumDeleted != int64(len(keyValues)) {
@@ -158,29 +164,28 @@ func TestKVDBCoverage(t *testing.T) {
 // TestKVDBInternalMethods verifies no internal methods are available
 // HTTP DB interface.
 func TestKVDBInternalMethods(t *testing.T) {
-	addr, _, stopper := startServer(t)
-	defer stopper.Stop()
+	s := startServer(t)
+	defer s.Stop()
 
 	testCases := []struct {
-		method string
-		args   proto.Request
-		reply  proto.Response
+		args  proto.Request
+		reply proto.Response
 	}{
-		{proto.InternalRangeLookup, &proto.InternalRangeLookupRequest{}, &proto.InternalRangeLookupResponse{}},
-		{proto.InternalGC, &proto.InternalGCRequest{}, &proto.InternalGCResponse{}},
-		{proto.InternalHeartbeatTxn, &proto.InternalHeartbeatTxnRequest{}, &proto.InternalHeartbeatTxnResponse{}},
-		{proto.InternalPushTxn, &proto.InternalPushTxnRequest{}, &proto.InternalPushTxnResponse{}},
-		{proto.InternalResolveIntent, &proto.InternalResolveIntentRequest{}, &proto.InternalResolveIntentResponse{}},
-		{proto.InternalMerge, &proto.InternalMergeRequest{}, &proto.InternalMergeResponse{}},
-		{proto.InternalTruncateLog, &proto.InternalTruncateLogRequest{}, &proto.InternalTruncateLogResponse{}},
+		{&proto.InternalRangeLookupRequest{}, &proto.InternalRangeLookupResponse{}},
+		{&proto.InternalGCRequest{}, &proto.InternalGCResponse{}},
+		{&proto.InternalHeartbeatTxnRequest{}, &proto.InternalHeartbeatTxnResponse{}},
+		{&proto.InternalPushTxnRequest{}, &proto.InternalPushTxnResponse{}},
+		{&proto.InternalResolveIntentRequest{}, &proto.InternalResolveIntentResponse{}},
+		{&proto.InternalMergeRequest{}, &proto.InternalMergeResponse{}},
+		{&proto.InternalTruncateLogRequest{}, &proto.InternalTruncateLogResponse{}},
 	}
 	// Verify non-public methods experience bad request errors.
-	kvClient := createTestClient(addr)
+	kvClient := createTestClient(t, s.ServingAddr())
 	for i, test := range testCases {
 		test.args.Header().Key = proto.Key("a")
-		err := kvClient.Call(test.method, test.args, test.reply)
+		err := kvClient.Run(client.Call{Args: test.args, Reply: test.reply})
 		if err == nil {
-			t.Errorf("%d: unexpected success calling %s", i, test.method)
+			t.Errorf("%d: unexpected success calling %s", i, test.args.Method())
 		} else if err.Error() != "404 Not Found" {
 			t.Errorf("%d: expected 404; got %s", i, err)
 		}
@@ -190,24 +195,27 @@ func TestKVDBInternalMethods(t *testing.T) {
 // TestKVDBEndTransactionWithTriggers verifies that triggers are
 // disallowed on call to EndTransaction.
 func TestKVDBEndTransactionWithTriggers(t *testing.T) {
-	addr, _, stopper := startServer(t)
-	defer stopper.Stop()
+	s := startServer(t)
+	defer s.Stop()
 
-	kvClient := createTestClient(addr)
+	kvClient := createTestClient(t, s.ServingAddr())
 	txnOpts := &client.TransactionOptions{Name: "test"}
-	err := kvClient.RunTransaction(txnOpts, func(txn *client.KV) error {
+	err := kvClient.RunTransaction(txnOpts, func(txn *client.Txn) error {
 		// Make an EndTransaction request which would fail if not
 		// stripped. In this case, we set the start key to "bar" for a
 		// split of the default range; start key must be "" in this case.
-		return txn.Call(proto.EndTransaction, &proto.EndTransactionRequest{
-			RequestHeader: proto.RequestHeader{Key: proto.Key("foo")},
-			Commit:        true,
-			InternalCommitTrigger: &proto.InternalCommitTrigger{
-				SplitTrigger: &proto.SplitTrigger{
-					UpdatedDesc: proto.RangeDescriptor{StartKey: proto.Key("bar")},
+		return txn.Run(client.Call{
+			Args: &proto.EndTransactionRequest{
+				RequestHeader: proto.RequestHeader{Key: proto.Key("foo")},
+				Commit:        true,
+				InternalCommitTrigger: &proto.InternalCommitTrigger{
+					SplitTrigger: &proto.SplitTrigger{
+						UpdatedDesc: proto.RangeDescriptor{StartKey: proto.Key("bar")},
+					},
 				},
 			},
-		}, &proto.EndTransactionResponse{})
+			Reply: &proto.EndTransactionResponse{},
+		})
 	})
 	if err == nil {
 		t.Errorf("expected 400 bad request error on commit")
@@ -217,8 +225,8 @@ func TestKVDBEndTransactionWithTriggers(t *testing.T) {
 // TestKVDBContentTypes verifies all combinations of request /
 // response content encodings are supported.
 func TestKVDBContentType(t *testing.T) {
-	addr, _, stopper := startServer(t)
-	defer stopper.Stop()
+	s := startServer(t)
+	defer s.Stop()
 
 	putReq := &proto.PutRequest{
 		RequestHeader: proto.RequestHeader{
@@ -259,7 +267,8 @@ func TestKVDBContentType(t *testing.T) {
 			t.Fatalf("%d: %s", i, err)
 		}
 		// Send a Put request but with non-canonical capitalization.
-		httpReq, err := http.NewRequest("POST", "http://"+addr+kv.DBPrefix+"Put", bytes.NewReader(body))
+		httpReq, err := http.NewRequest("POST", testContext.RequestScheme()+"://"+s.ServingAddr()+kv.DBPrefix+"Put",
+			bytes.NewReader(body))
 		if err != nil {
 			t.Fatalf("%d: %s", i, err)
 		}
@@ -267,7 +276,7 @@ func TestKVDBContentType(t *testing.T) {
 		if test.accept != "" {
 			httpReq.Header.Add(util.AcceptHeader, test.accept)
 		}
-		resp, err := http.DefaultClient.Do(httpReq)
+		resp, err := httpDoReq(testContext, httpReq)
 		if err != nil {
 			t.Fatalf("%d: %s", i, err)
 		}
@@ -288,10 +297,10 @@ func TestKVDBContentType(t *testing.T) {
 // TestKVDBTransaction verifies that transactions work properly over
 // the KV DB endpoint.
 func TestKVDBTransaction(t *testing.T) {
-	addr, _, stopper := startServer(t)
-	defer stopper.Stop()
+	s := startServer(t)
+	defer s.Stop()
 
-	kvClient := createTestClient(addr)
+	kvClient := createTestClient(t, s.ServingAddr())
 
 	key := proto.Key("db-txn-test")
 	value := []byte("value")
@@ -300,15 +309,15 @@ func TestKVDBTransaction(t *testing.T) {
 		Name:      "test",
 		Isolation: proto.SNAPSHOT,
 	}
-	err := kvClient.RunTransaction(txnOpts, func(txn *client.KV) error {
-		pr := &proto.PutResponse{}
-		if err := txn.Call(proto.Put, proto.PutArgs(key, value), pr); err != nil {
+	err := kvClient.RunTransaction(txnOpts, func(txn *client.Txn) error {
+		if err := txn.Run(client.Put(key, value)); err != nil {
 			t.Fatal(err)
 		}
 
 		// Attempt to read outside of txn.
-		gr := &proto.GetResponse{}
-		if err := kvClient.Call(proto.Get, proto.GetArgs(key), gr); err != nil {
+		call := client.Get(key)
+		gr := call.Reply.(*proto.GetResponse)
+		if err := kvClient.Run(call); err != nil {
 			t.Fatal(err)
 		}
 		if gr.Value != nil {
@@ -316,7 +325,9 @@ func TestKVDBTransaction(t *testing.T) {
 		}
 
 		// Read within the transaction.
-		if err := txn.Call(proto.Get, proto.GetArgs(key), gr); err != nil {
+		call = client.Get(key)
+		gr = call.Reply.(*proto.GetResponse)
+		if err := txn.Run(call); err != nil {
 			t.Fatal(err)
 		}
 		if gr.Value == nil || !bytes.Equal(gr.Value.Bytes, value) {
@@ -329,8 +340,9 @@ func TestKVDBTransaction(t *testing.T) {
 	}
 
 	// Verify the value is now visible after commit.
-	gr := &proto.GetResponse{}
-	if err = kvClient.Call(proto.Get, proto.GetArgs(key), gr); err != nil {
+	call := client.Get(key)
+	gr := call.Reply.(*proto.GetResponse)
+	if err = kvClient.Run(call); err != nil {
 		t.Errorf("expected success reading value; got %s", err)
 	}
 	if gr.Value == nil || !bytes.Equal(gr.Value.Bytes, value) {

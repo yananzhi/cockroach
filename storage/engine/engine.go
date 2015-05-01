@@ -28,17 +28,6 @@ import (
 	gogoproto "github.com/gogo/protobuf/proto"
 )
 
-// StoreCapacity contains capacity information for a storage device.
-type StoreCapacity struct {
-	Capacity  int64
-	Available int64
-}
-
-// PercentAvail computes the percentage of disk space that is available.
-func (sc StoreCapacity) PercentAvail() float64 {
-	return float64(sc.Available) / float64(sc.Capacity)
-}
-
 // Iterator is an interface for iterating over key/value pairs in an
 // engine. Iterator implementation are thread safe unless otherwise
 // noted.
@@ -95,10 +84,6 @@ type Engine interface {
 	// Note that clear actually removes entries from the storage
 	// engine, rather than inserting tombstones.
 	Clear(key proto.EncodedKey) error
-	// WriteBatch atomically applies the specified writes, deletions and
-	// merges. The list passed to WriteBatch must only contain elements
-	// of type Batch{Put,Merge,Delete}.
-	WriteBatch([]interface{}) error
 	// Merge is a high-performance write operation used for values which are
 	// accumulated over several writes. Multiple values can be merged
 	// sequentially into a single key; a subsequent read will return a "merged"
@@ -114,7 +99,7 @@ type Engine interface {
 	// The logic for merges is written in db.cc in order to be compatible with RocksDB.
 	Merge(key proto.EncodedKey, value []byte) error
 	// Capacity returns capacity details for the engine's available storage.
-	Capacity() (StoreCapacity, error)
+	Capacity() (proto.StoreCapacity, error)
 	// SetGCTimeouts sets a function which yields timeout values for GC
 	// compaction of transaction and response cache entries. The return
 	// values are in unix nanoseconds for the minimum transaction row
@@ -145,21 +130,6 @@ type Engine interface {
 	// Commit atomically applies any batched updates to the underlying
 	// engine. This is a noop unless the engine was created via NewBatch().
 	Commit() error
-}
-
-// A BatchDelete is a delete operation executed as part of an atomic batch.
-type BatchDelete struct {
-	proto.RawKeyValue
-}
-
-// A BatchPut is a put operation executed as part of an atomic batch.
-type BatchPut struct {
-	proto.RawKeyValue
-}
-
-// A BatchMerge is a merge operation executed as part of an atomic batch.
-type BatchMerge struct {
-	proto.RawKeyValue
 }
 
 var bufferPool = sync.Pool{
@@ -255,12 +225,15 @@ func Scan(engine Engine, start, end proto.EncodedKey, max int64) ([]proto.RawKey
 // actually removes entries from the storage engine, rather than
 // inserting tombstones, as with deletion through the MVCC.
 func ClearRange(engine Engine, start, end proto.EncodedKey) (int, error) {
-	var deletes []interface{}
+	b := engine.NewBatch()
+	defer b.Close()
+	count := 0
 	if err := engine.Iterate(start, end, func(kv proto.RawKeyValue) (bool, error) {
-		deletes = append(deletes, BatchDelete{proto.RawKeyValue{Key: kv.Key}})
+		b.Clear(kv.Key)
+		count++
 		return false, nil
 	}); err != nil {
 		return 0, err
 	}
-	return len(deletes), engine.WriteBatch(deletes)
+	return count, b.Commit()
 }

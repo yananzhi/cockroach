@@ -18,14 +18,12 @@
 package kv_test
 
 import (
-	"net/http"
 	"testing"
 	"time"
 
 	"github.com/cockroachdb/cockroach/client"
 	"github.com/cockroachdb/cockroach/kv"
 	"github.com/cockroachdb/cockroach/proto"
-	"github.com/cockroachdb/cockroach/rpc"
 	"github.com/cockroachdb/cockroach/server"
 	"github.com/cockroachdb/cockroach/storage"
 	"github.com/cockroachdb/cockroach/storage/engine"
@@ -42,15 +40,9 @@ import (
 // proceed in the event that a write intent is extant at the meta
 // index record being read.
 func TestRangeLookupWithOpenTransaction(t *testing.T) {
-	s := &server.TestServer{}
-	if err := s.Start(); err != nil {
-		t.Fatal(err)
-	}
+	s := startServer(t)
 	defer s.Stop()
-	sender := client.NewHTTPSender(s.Addr, &http.Transport{
-		TLSClientConfig: rpc.LoadInsecureTLSConfig().Config(),
-	})
-	db := client.NewKV(nil, sender)
+	db := createTestClient(t, s.ServingAddr())
 	db.User = storage.UserRoot
 
 	// Create an intent on the meta1 record by writing directly to the
@@ -58,7 +50,7 @@ func TestRangeLookupWithOpenTransaction(t *testing.T) {
 	key := engine.MakeKey(engine.KeyMeta1Prefix, engine.KeyMax)
 	now := s.Clock().Now()
 	txn := proto.NewTransaction("txn", proto.Key("foobar"), 0, proto.SERIALIZABLE, now, 0)
-	if err := engine.MVCCPutProto(s.Engine, nil, key, now, txn, &proto.RangeDescriptor{}); err != nil {
+	if err := engine.MVCCPutProto(s.Engines[0], nil, key, now, txn, &proto.RangeDescriptor{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -71,7 +63,7 @@ func TestRangeLookupWithOpenTransaction(t *testing.T) {
 	// lookup, etc, ad nauseam.
 	success := make(chan struct{})
 	go func() {
-		if err := db.Call(proto.Get, proto.GetArgs(proto.Key("a")), &proto.GetResponse{}); err != nil {
+		if err := db.Run(client.Get(proto.Key("a"))); err != nil {
 			t.Fatal(err)
 		}
 		close(success)
@@ -80,7 +72,7 @@ func TestRangeLookupWithOpenTransaction(t *testing.T) {
 	select {
 	case <-success:
 		// Hurrah!
-	case <-time.After(1 * time.Second):
+	case <-time.After(5 * time.Second):
 		t.Errorf("get request did not succeed in face of range metadata intent")
 	}
 }
@@ -90,24 +82,20 @@ func TestRangeLookupWithOpenTransaction(t *testing.T) {
 // The caller is responsible for stopping the server and
 // closing the client.
 func setupMultipleRanges(t *testing.T) (*server.TestServer, *client.KV) {
-	s := &server.TestServer{}
-	if err := s.Start(); err != nil {
-		t.Fatal(err)
-	}
-	sender := client.NewHTTPSender(s.Addr, &http.Transport{
-		TLSClientConfig: rpc.LoadInsecureTLSConfig().Config(),
-	})
-	db := client.NewKV(nil, sender)
+	s := startServer(t)
+	db := createTestClient(t, s.ServingAddr())
 	db.User = storage.UserRoot
 
 	// Split the keyspace at "b".
-	if err := db.Call(proto.AdminSplit,
-		&proto.AdminSplitRequest{
+	if err := db.Run(client.Call{
+		Args: &proto.AdminSplitRequest{
 			RequestHeader: proto.RequestHeader{
 				Key: proto.Key("b"),
 			},
 			SplitKey: proto.Key("b"),
-		}, &proto.AdminSplitResponse{}); err != nil {
+		},
+		Reply: &proto.AdminSplitResponse{},
+	}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -121,14 +109,14 @@ func TestMultiRangeScan(t *testing.T) {
 
 	// Write keys "a" and "b".
 	for _, key := range []proto.Key{proto.Key("a"), proto.Key("b")} {
-		pr := &proto.PutResponse{}
-		if err := db.Call(proto.Put, proto.PutArgs(key, []byte("value")), pr); err != nil {
+		if err := db.Run(client.Put(key, []byte("value"))); err != nil {
 			t.Fatal(err)
 		}
 	}
 
-	sr := &proto.ScanResponse{}
-	if err := db.Call(proto.Scan, proto.ScanArgs(proto.Key("a"), proto.Key("c"), 0), sr); err != nil {
+	call := client.Scan(proto.Key("a"), proto.Key("c"), 0)
+	sr := call.Reply.(*proto.ScanResponse)
+	if err := db.Run(call); err != nil {
 		t.Fatalf("unexpected error on scan: %s", err)
 	}
 	if l := len(sr.Rows); l != 2 {
@@ -147,25 +135,27 @@ func TestMultiRangeScanInconsistent(t *testing.T) {
 	keys := []proto.Key{proto.Key("a"), proto.Key("b")}
 	ts := []proto.Timestamp{}
 	for _, key := range keys {
-		pr := &proto.PutResponse{}
-		if err := db.Call(proto.Put, proto.PutArgs(key, []byte("value")), pr); err != nil {
+		call := client.Put(key, []byte("value"))
+		pr := call.Reply.(*proto.PutResponse)
+		if err := db.Run(call); err != nil {
 			t.Fatal(err)
 		}
 		ts = append(ts, pr.Timestamp)
 	}
 
 	// Do an inconsistent scan from a new dist sender and verify it does
-	// the read at it's local clock and doesn't receive an
+	// the read at its local clock and doesn't receive an
 	// OpRequiresTxnError. We set the local clock to the timestamp of
 	// the first key to verify it's used to read only key "a".
 	manual := hlc.NewManualClock(ts[1].WallTime - 1)
 	clock := hlc.NewClock(manual.UnixNano)
 	ds := kv.NewDistSender(&kv.DistSenderContext{Clock: clock}, s.Gossip())
-	sa := proto.ScanArgs(proto.Key("a"), proto.Key("c"), 0)
+	call := client.Scan(proto.Key("a"), proto.Key("c"), 0)
+	sr := call.Reply.(*proto.ScanResponse)
+	sa := call.Args.(*proto.ScanRequest)
 	sa.ReadConsistency = proto.INCONSISTENT
 	sa.User = storage.UserRoot
-	sr := &proto.ScanResponse{}
-	ds.Send(&client.Call{Method: proto.Scan, Args: sa, Reply: sr})
+	ds.Send(call)
 	if err := sr.GoError(); err != nil {
 		t.Fatal(err)
 	}

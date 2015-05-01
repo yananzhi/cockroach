@@ -23,7 +23,6 @@ import (
 	"io"
 	"io/ioutil"
 	"net/http"
-	"os"
 	"strings"
 	"testing"
 
@@ -34,22 +33,11 @@ import (
 	"github.com/cockroachdb/cockroach/proto"
 	"github.com/cockroachdb/cockroach/storage"
 	"github.com/cockroachdb/cockroach/storage/engine"
+	"github.com/cockroachdb/cockroach/util"
 	"github.com/cockroachdb/cockroach/util/log"
 )
 
-var testContext = NewContext()
-
-// startTestServer starts a test server. The server will be initialized with an
-// in-memory engine and will execute a split at key "m" so that
-// it will end up having two logical ranges.
-func startTestServer(t *testing.T) *TestServer {
-	s := &TestServer{}
-	if err := s.Start(); err != nil {
-		t.Fatalf("Could not start server: %v", err)
-	}
-	log.Infof("Test server listening on http: %s", s.Addr)
-	return s
-}
+var testContext = NewTestContext()
 
 // createTestConfigFile creates a temporary file and writes the
 // testConfig yaml data to it. The caller is responsible for
@@ -65,31 +53,10 @@ func createTestConfigFile(body string) string {
 	return f.Name()
 }
 
-// createTempDirs creates "count" temporary directories and returns
-// the paths to each as a slice.
-func createTempDirs(count int, t *testing.T) []string {
-	tmp := make([]string, count)
-	for i := 0; i < count; i++ {
-		var err error
-		if tmp[i], err = ioutil.TempDir("", "_server_test"); err != nil {
-			t.Fatal(err)
-		}
-	}
-	return tmp
-}
-
-// resetTestData recursively removes all files written to the
-// directories specified as parameters.
-func resetTestData(dirs []string) {
-	for _, dir := range dirs {
-		os.RemoveAll(dir)
-	}
-}
-
 // TestInitEngine tests whether the data directory string is parsed correctly.
 func TestInitEngine(t *testing.T) {
-	tmp := createTempDirs(5, t)
-	defer resetTestData(tmp)
+	tmp := util.CreateNTempDirs(t, "_server_test", 5)
+	defer util.CleanupDirs(tmp)
 
 	testCases := []struct {
 		key       string           // data directory
@@ -114,7 +81,7 @@ func TestInitEngine(t *testing.T) {
 	for _, spec := range testCases {
 		ctx := NewContext()
 		ctx.Stores, ctx.GossipBootstrap = spec.key, "self://"
-		err := ctx.Init()
+		err := ctx.Init("start")
 		engines := ctx.Engines
 		if err == nil {
 			if spec.wantError {
@@ -140,8 +107,8 @@ func TestInitEngine(t *testing.T) {
 // TestInitEngines tests whether multiple engines specified as a
 // single comma-separated list are parsed correctly.
 func TestInitEngines(t *testing.T) {
-	tmp := createTempDirs(2, t)
-	defer resetTestData(tmp)
+	tmp := util.CreateNTempDirs(t, "_server_test", 2)
+	defer util.CleanupDirs(tmp)
 
 	ctx := NewContext()
 	ctx.Stores = fmt.Sprintf("mem=1000,mem:ddr3=1000,ssd=%s,hdd:7200rpm=%s", tmp[0], tmp[1])
@@ -156,7 +123,7 @@ func TestInitEngines(t *testing.T) {
 		{proto.Attributes{Attrs: []string{"hdd", "7200rpm"}}, false},
 	}
 
-	err := ctx.Init()
+	err := ctx.Init("start")
 	engines := ctx.Engines
 	if err != nil {
 		t.Fatal(err)
@@ -178,16 +145,20 @@ func TestInitEngines(t *testing.T) {
 // TestSelfBootstrap verifies operation when no bootstrap hosts have
 // been specified.
 func TestSelfBootstrap(t *testing.T) {
-	s := startTestServer(t)
+	s := StartTestServer(t)
 	s.Stop()
 }
 
 // TestHealth verifies that health endpoint return "ok".
 func TestHealth(t *testing.T) {
-	s := startTestServer(t)
+	s := StartTestServer(t)
 	defer s.Stop()
-	url := "http://" + s.Addr + healthPath
-	resp, err := http.Get(url)
+	url := testContext.RequestScheme() + "://" + s.ServingAddr() + healthPath
+	httpClient, err := testContext.GetHTTPClient()
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := httpClient.Get(url)
 	if err != nil {
 		t.Fatalf("error requesting health at %s: %s", url, err)
 	}
@@ -202,14 +173,72 @@ func TestHealth(t *testing.T) {
 	}
 }
 
+// TestPlainHTTPServer verifies that we can serve plain http and talk to it.
+// This is controlled by -cert=""
+func TestPlainHTTPServer(t *testing.T) {
+	// Create a custom context. The default one has a default -certs value.
+	ctx := NewContext()
+	ctx.Addr = "127.0.0.1:0"
+	ctx.Insecure = true
+	// TestServer.Start does not override the context if set.
+	s := &TestServer{Ctx: ctx}
+	if err := s.Start(); err != nil {
+		t.Fatalf("could not start plain http server: %v", err)
+	}
+	defer s.Stop()
+
+	// Get a plain http client using the same context.
+	if ctx.RequestScheme() != "http" {
+		t.Fatalf("expected context.RequestScheme == \"http\", got: %s", ctx.RequestScheme())
+	}
+	url := ctx.RequestScheme() + "://" + s.ServingAddr() + healthPath
+	httpClient, err := ctx.GetHTTPClient()
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := httpClient.Get(url)
+	if err != nil {
+		t.Fatalf("error requesting health at %s: %s", url, err)
+	}
+	defer resp.Body.Close()
+	b, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("could not read response body: %s", err)
+	}
+	expected := "ok"
+	if !strings.Contains(string(b), expected) {
+		t.Errorf("expected body to contain %q, got %q", expected, string(b))
+	}
+
+	// Try again with a https client (testContext is one)
+	if testContext.RequestScheme() != "https" {
+		t.Fatalf("expected context.RequestScheme == \"http\", got: %s", testContext.RequestScheme())
+	}
+	url = testContext.RequestScheme() + "://" + s.ServingAddr() + healthPath
+	httpClient, err = ctx.GetHTTPClient()
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err = httpClient.Get(url)
+	if err == nil {
+		t.Fatalf("unexpected success fetching %s", url)
+	}
+}
+
 // TestAcceptEncoding hits the health endpoint while explicitly
 // disabling decompression on a custom client's Transport and setting
 // it conditionally via the request's Accept-Encoding headers.
 func TestAcceptEncoding(t *testing.T) {
-	s := startTestServer(t)
+	s := StartTestServer(t)
 	defer s.Stop()
-	client := http.Client{
+	// We can't use the standard test client. Create our own.
+	tlsConfig, err := testContext.GetServerTLSConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &http.Client{
 		Transport: &http.Transport{
+			TLSClientConfig:    tlsConfig,
 			Proxy:              http.ProxyFromEnvironment,
 			DisableCompression: true,
 		},
@@ -240,7 +269,7 @@ func TestAcceptEncoding(t *testing.T) {
 		},
 	}
 	for _, d := range testData {
-		req, err := http.NewRequest("GET", "http://"+s.Addr+healthPath, nil)
+		req, err := http.NewRequest("GET", testContext.RequestScheme()+"://"+s.ServingAddr()+healthPath, nil)
 		if err != nil {
 			t.Fatalf("could not create request: %s", err)
 		}
@@ -270,25 +299,29 @@ func TestAcceptEncoding(t *testing.T) {
 // TestMultiRangeScanDeleteRange tests that commands which access multiple
 // ranges are carried out properly.
 func TestMultiRangeScanDeleteRange(t *testing.T) {
-	s := startTestServer(t)
+	s := StartTestServer(t)
 	defer s.Stop()
 	ds := kv.NewDistSender(&kv.DistSenderContext{Clock: s.Clock()}, s.Gossip())
 	tds := kv.NewTxnCoordSender(ds, s.Clock(), testContext.Linearizable, s.stopper)
 
-	if err := s.node.db.Call(proto.AdminSplit,
-		&proto.AdminSplitRequest{
+	if err := s.node.ctx.DB.Run(client.Call{
+		Args: &proto.AdminSplitRequest{
 			RequestHeader: proto.RequestHeader{
 				Key: proto.Key("m"),
 			},
 			SplitKey: proto.Key("m"),
-		}, &proto.AdminSplitResponse{}); err != nil {
+		},
+		Reply: &proto.AdminSplitResponse{}}); err != nil {
 		t.Fatal(err)
 	}
 	writes := []proto.Key{proto.Key("a"), proto.Key("z")}
-	get := &client.Call{
-		Method: proto.Get,
-		Args:   proto.GetArgs(writes[0]),
-		Reply:  &proto.GetResponse{},
+	get := client.Call{
+		Args: &proto.GetRequest{
+			RequestHeader: proto.RequestHeader{
+				Key: writes[0],
+			},
+		},
+		Reply: &proto.GetResponse{},
 	}
 	get.Args.Header().User = storage.UserRoot
 	get.Args.Header().EndKey = writes[len(writes)-1]
@@ -296,23 +329,15 @@ func TestMultiRangeScanDeleteRange(t *testing.T) {
 	if err := get.Reply.Header().GoError(); err == nil {
 		t.Errorf("able to call Get with a key range: %v", get)
 	}
-	var call *client.Call
+	var call client.Call
 	for i, k := range writes {
-		call = &client.Call{
-			Method: proto.Put,
-			Args:   proto.PutArgs(k, k),
-			Reply:  &proto.PutResponse{},
-		}
+		call = client.Put(k, k)
 		call.Args.Header().User = storage.UserRoot
 		tds.Send(call)
 		if err := call.Reply.Header().GoError(); err != nil {
 			t.Fatal(err)
 		}
-		scan := &client.Call{
-			Method: proto.Scan,
-			Args:   proto.ScanArgs(writes[0], writes[len(writes)-1].Next(), 0),
-			Reply:  &proto.ScanResponse{},
-		}
+		scan := client.Scan(writes[0], writes[len(writes)-1].Next(), 0)
 		// The Put ts may have been pushed by tsCache,
 		// so make sure we see their values in our Scan.
 		scan.Args.Header().Timestamp = call.Reply.Header().Timestamp
@@ -329,8 +354,7 @@ func TestMultiRangeScanDeleteRange(t *testing.T) {
 		}
 	}
 
-	del := &client.Call{
-		Method: proto.DeleteRange,
+	del := client.Call{
 		Args: &proto.DeleteRangeRequest{
 			RequestHeader: proto.RequestHeader{
 				User:      storage.UserRoot,
@@ -353,11 +377,7 @@ func TestMultiRangeScanDeleteRange(t *testing.T) {
 			len(writes), n)
 	}
 
-	scan := &client.Call{
-		Method: proto.Scan,
-		Args:   proto.ScanArgs(writes[0], writes[len(writes)-1].Next(), 0),
-		Reply:  &proto.ScanResponse{},
-	}
+	scan := client.Scan(writes[0], writes[len(writes)-1].Next(), 0)
 	scan.Args.Header().Timestamp = del.Reply.Header().Timestamp
 	scan.Args.Header().User = storage.UserRoot
 	scan.Args.Header().Txn = &proto.Transaction{Name: "MyTxn"}
@@ -388,29 +408,26 @@ func TestMultiRangeScanWithMaxResults(t *testing.T) {
 	}
 
 	for _, tc := range testCases {
-		s := startTestServer(t)
+		s := StartTestServer(t)
 		ds := kv.NewDistSender(&kv.DistSenderContext{Clock: s.Clock()}, s.Gossip())
 		tds := kv.NewTxnCoordSender(ds, s.Clock(), testContext.Linearizable, s.stopper)
 
 		for _, sk := range tc.splitKeys {
-			if err := s.node.db.Call(proto.AdminSplit,
-				&proto.AdminSplitRequest{
+			if err := s.node.ctx.DB.Run(client.Call{
+				Args: &proto.AdminSplitRequest{
 					RequestHeader: proto.RequestHeader{
 						Key: sk,
 					},
 					SplitKey: sk,
-				}, &proto.AdminSplitResponse{}); err != nil {
+				},
+				Reply: &proto.AdminSplitResponse{}}); err != nil {
 				t.Fatal(err)
 			}
 		}
 
-		var call *client.Call
+		var call client.Call
 		for _, k := range tc.keys {
-			call = &client.Call{
-				Method: proto.Put,
-				Args:   proto.PutArgs(k, k),
-				Reply:  &proto.PutResponse{},
-			}
+			call = client.Put(k, k)
 			call.Args.Header().User = storage.UserRoot
 			tds.Send(call)
 			if err := call.Reply.Header().GoError(); err != nil {
@@ -422,12 +439,8 @@ func TestMultiRangeScanWithMaxResults(t *testing.T) {
 		for start := 0; start < len(tc.keys); start++ {
 			// Try every possible maxResults, from 1 to beyond the size of key array.
 			for maxResults := 1; maxResults <= len(tc.keys)-start+1; maxResults++ {
-				scan := &client.Call{
-					Method: proto.Scan,
-					Args: proto.ScanArgs(tc.keys[start], tc.keys[len(tc.keys)-1].Next(),
-						int64(maxResults)),
-					Reply: &proto.ScanResponse{},
-				}
+				scan := client.Scan(tc.keys[start], tc.keys[len(tc.keys)-1].Next(),
+					int64(maxResults))
 				scan.Args.Header().Timestamp = call.Reply.Header().Timestamp
 				scan.Args.Header().User = storage.UserRoot
 				tds.Send(scan)

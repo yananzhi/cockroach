@@ -21,7 +21,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/cockroach/proto"
 	"github.com/cockroachdb/cockroach/rpc"
+	"github.com/cockroachdb/cockroach/security"
 	"github.com/cockroachdb/cockroach/util"
 	"github.com/cockroachdb/cockroach/util/hlc"
 	"github.com/cockroachdb/cockroach/util/log"
@@ -36,9 +38,9 @@ const (
 // startGossip creates local and remote gossip instances.
 // The remote gossip instance launches its gossip service.
 func startGossip(t *testing.T) (local, remote *Gossip, stopper *util.Stopper) {
-	tlsConfig := rpc.LoadInsecureTLSConfig()
+	tlsConfig := security.LoadInsecureTLSConfig()
 	lclock := hlc.NewClock(hlc.UnixNano)
-	lRPCContext := rpc.NewContext(lclock, tlsConfig)
+	lRPCContext := rpc.NewContext(lclock, tlsConfig, nil)
 
 	laddr := util.CreateTestAddr("unix")
 	lserver := rpc.NewServer(laddr, lRPCContext)
@@ -46,14 +48,27 @@ func startGossip(t *testing.T) (local, remote *Gossip, stopper *util.Stopper) {
 		t.Fatal(err)
 	}
 	local = New(lRPCContext, gossipInterval, TestBootstrap)
+	local.SetNodeDescriptor(&proto.NodeDescriptor{
+		NodeID: 1,
+		Address: proto.Addr{
+			Network: laddr.Network(),
+			Address: laddr.String(),
+		}})
 	rclock := hlc.NewClock(hlc.UnixNano)
 	raddr := util.CreateTestAddr("unix")
-	rRPCContext := rpc.NewContext(rclock, tlsConfig)
+	rRPCContext := rpc.NewContext(rclock, tlsConfig, nil)
 	rserver := rpc.NewServer(raddr, rRPCContext)
 	if err := rserver.Start(); err != nil {
 		t.Fatal(err)
 	}
 	remote = New(rRPCContext, gossipInterval, TestBootstrap)
+	local.SetNodeDescriptor(&proto.NodeDescriptor{
+		NodeID: 2,
+		Address: proto.Addr{
+			Network: raddr.Network(),
+			Address: raddr.String(),
+		},
+	})
 	stopper = util.NewStopper()
 	stopper.AddCloser(lserver)
 	stopper.AddCloser(rserver)
@@ -71,7 +86,7 @@ func TestClientGossip(t *testing.T) {
 	disconnected := make(chan *client, 1)
 
 	client := newClient(remote.is.NodeAddr)
-	client.start(local, disconnected, stopper)
+	client.start(local, disconnected, local.RPCContext, stopper)
 
 	if err := util.IsTrueWithin(func() bool {
 		_, lerr := remote.GetInfo("local-key")
@@ -100,8 +115,8 @@ func TestClientDisconnectRedundant(t *testing.T) {
 	remote.mu.Lock()
 	rAddr := remote.is.NodeAddr
 	lAddr := local.is.NodeAddr
-	local.startClient(rAddr, stopper)
-	remote.startClient(lAddr, stopper)
+	local.startClient(rAddr, local.RPCContext, stopper)
+	remote.startClient(lAddr, remote.RPCContext, stopper)
 	local.mu.Unlock()
 	remote.mu.Unlock()
 	local.manage(stopper)
@@ -109,12 +124,8 @@ func TestClientDisconnectRedundant(t *testing.T) {
 	wasConnected1, wasConnected2 := false, false
 	if err := util.IsTrueWithin(func() bool {
 		// Check which of the clients is connected to the other.
-		local.clientsMu.Lock()
-		defer local.clientsMu.Unlock()
-		remote.clientsMu.Lock()
-		defer remote.clientsMu.Unlock()
-		_, ok1 := local.clients[rAddr.String()]
-		_, ok2 := remote.clients[lAddr.String()]
+		ok1 := local.findClient(func(c *client) bool { return c.addr.String() == rAddr.String() }) != nil
+		ok2 := remote.findClient(func(c *client) bool { return c.addr.String() == lAddr.String() }) != nil
 		if ok1 {
 			wasConnected1 = true
 		}

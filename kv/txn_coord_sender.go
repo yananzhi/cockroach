@@ -106,8 +106,7 @@ func (tm *txnMetadata) close(txn *proto.Transaction, resolved []proto.Key, sende
 		log.V(1).Infof("cleaning up %d intent(s) for transaction %s", tm.keys.Len(), txn)
 	}
 	for _, o := range tm.keys.GetOverlaps(engine.KeyMin, engine.KeyMax) {
-		call := &client.Call{
-			Method: proto.InternalResolveIntent,
+		call := client.Call{
 			Args: &proto.InternalResolveIntentRequest{
 				RequestHeader: proto.RequestHeader{
 					Timestamp: txn.Timestamp,
@@ -191,14 +190,29 @@ func NewTxnCoordSender(wrapped client.KVSender, clock *hlc.Clock, linearizable b
 // Send implements the client.KVSender interface. If the call is part
 // of a transaction, the coordinator will initialize the transaction
 // if it's not nil but has an empty ID.
-func (tc *TxnCoordSender) Send(call *client.Call) {
+func (tc *TxnCoordSender) Send(call client.Call) {
 	header := call.Args.Header()
 	tc.maybeBeginTxn(header)
 
 	// Process batch specially; otherwise, send via wrapped sender.
-	if call.Method == proto.Batch {
-		tc.sendBatch(call.Args.(*proto.BatchRequest), call.Reply.(*proto.BatchResponse))
-	} else {
+	switch args := call.Args.(type) {
+	case *proto.InternalBatchRequest:
+		tc.sendBatch(args, call.Reply.(*proto.InternalBatchResponse))
+	case *proto.BatchRequest:
+		// Convert the batch request to internal-batch request.
+		internalArgs := &proto.InternalBatchRequest{RequestHeader: args.RequestHeader}
+		internalReply := &proto.InternalBatchResponse{}
+		for i := range args.Requests {
+			internalArgs.Add(args.Requests[i].GetValue().(proto.Request))
+		}
+		tc.sendBatch(internalArgs, internalReply)
+		reply := call.Reply.(*proto.BatchResponse)
+		reply.ResponseHeader = internalReply.ResponseHeader
+		// Convert form internal-batch response to batch response.
+		for i := range internalReply.Responses {
+			reply.Add(internalReply.Responses[i].GetValue().(proto.Response))
+		}
+	default:
 		tc.sendOne(call)
 	}
 }
@@ -235,7 +249,7 @@ func (tc *TxnCoordSender) maybeBeginTxn(header *proto.RequestHeader) {
 // key range is recorded as live intents for eventual cleanup upon
 // transaction commit. Upon successful txn commit, initiates cleanup
 // of intents.
-func (tc *TxnCoordSender) sendOne(call *client.Call) {
+func (tc *TxnCoordSender) sendOne(call client.Call) {
 	var startNS int64
 	header := call.Args.Header()
 	// If this call is part of a transaction...
@@ -243,13 +257,13 @@ func (tc *TxnCoordSender) sendOne(call *client.Call) {
 		// Set the timestamp to the original timestamp for read-only
 		// commands and to the transaction timestamp for read/write
 		// commands.
-		if proto.IsReadOnly(call.Method) {
+		if proto.IsReadOnly(call.Args) {
 			header.Timestamp = header.Txn.OrigTimestamp
 		} else {
 			header.Timestamp = header.Txn.Timestamp
 		}
 		// End transaction must have its key set to the txn ID.
-		if call.Method == proto.EndTransaction {
+		if _, ok := call.Args.(*proto.EndTransactionRequest); ok {
 			header.Key = header.Txn.Key
 			// Remember when EndTransaction started in case we want to
 			// be linearizable.
@@ -271,7 +285,7 @@ func (tc *TxnCoordSender) sendOne(call *client.Call) {
 	// If successful, we're in a transaction, and the command leaves
 	// transactional intents, add the key or key range to the intents map.
 	// If the transaction metadata doesn't yet exist, create it.
-	if call.Reply.Header().GoError() == nil && header.Txn != nil && proto.IsTransactional(call.Method) {
+	if call.Reply.Header().GoError() == nil && header.Txn != nil && proto.IsTransactionWrite(call.Args) {
 		tc.Lock()
 		var ok bool
 		var txnMeta *txnMetadata
@@ -297,7 +311,7 @@ func (tc *TxnCoordSender) sendOne(call *client.Call) {
 		tc.cleanupTxn(&t.Txn, nil)
 	case *proto.OpRequiresTxnError:
 		// Run a one-off transaction with that single command.
-		log.Infof("%s: auto-wrapping in txn and re-executing", call.Method)
+		log.V(1).Infof("%s: auto-wrapping in txn and re-executing", call.Method())
 		txnOpts := &client.TransactionOptions{
 			Name: "auto-wrap",
 		}
@@ -307,13 +321,13 @@ func (tc *TxnCoordSender) sendOne(call *client.Call) {
 		tmpKV.User = call.Args.Header().User
 		tmpKV.UserPriority = call.Args.Header().GetUserPriority()
 		call.Reply.Reset()
-		tmpKV.RunTransaction(txnOpts, func(txn *client.KV) error {
-			return txn.Call(call.Method, call.Args, call.Reply)
+		tmpKV.RunTransaction(txnOpts, func(txn *client.Txn) error {
+			return txn.Run(call)
 		})
 	case nil:
 		var txn *proto.Transaction
 		var resolved []proto.Key
-		if call.Method == proto.EndTransaction {
+		if _, ok := call.Args.(*proto.EndTransactionRequest); ok {
 			txn = call.Reply.Header().Txn
 			// If the -linearizable flag is set, we want to make sure that
 			// all the clocks in the system are past the commit timestamp
@@ -344,7 +358,7 @@ func (tc *TxnCoordSender) sendOne(call *client.Call) {
 
 // sendBatch unrolls a batched command and sends each constituent
 // command in parallel.
-func (tc *TxnCoordSender) sendBatch(batchArgs *proto.BatchRequest, batchReply *proto.BatchResponse) {
+func (tc *TxnCoordSender) sendBatch(batchArgs *proto.InternalBatchRequest, batchReply *proto.InternalBatchResponse) {
 	// Prepare the calls by unrolling the batch. If the batchReply is
 	// pre-initialized with replies, use those; otherwise create replies
 	// as needed.
@@ -353,12 +367,7 @@ func (tc *TxnCoordSender) sendBatch(batchArgs *proto.BatchRequest, batchReply *p
 	for i := range batchArgs.Requests {
 		// Initialize args header values where appropriate.
 		args := batchArgs.Requests[i].GetValue().(proto.Request)
-		method, err := proto.MethodForRequest(args)
-		call := &client.Call{Method: method, Args: args}
-		if err != nil {
-			batchReply.SetGoError(err)
-			return
-		}
+		call := client.Call{Args: args}
 		if args.Header().User == "" {
 			args.Header().User = batchArgs.User
 		}
@@ -369,10 +378,7 @@ func (tc *TxnCoordSender) sendBatch(batchArgs *proto.BatchRequest, batchReply *p
 
 		// Create a reply from the method type and add to batch response.
 		if i >= len(batchReply.Responses) {
-			if call.Reply, err = proto.CreateReply(method); err != nil {
-				batchReply.SetGoError(util.Errorf("unsupported method in batch: %s", method))
-				return
-			}
+			call.Reply = args.CreateReply()
 			batchReply.Add(call.Reply)
 		} else {
 			call.Reply = batchReply.Responses[i].GetValue().(proto.Response)
@@ -507,10 +513,9 @@ func (tc *TxnCoordSender) heartbeat(txn *proto.Transaction) {
 				}
 				request.Header().Timestamp = tc.clock.Now()
 				reply := &proto.InternalHeartbeatTxnResponse{}
-				call := &client.Call{
-					Method: proto.InternalHeartbeatTxn,
-					Args:   request,
-					Reply:  reply,
+				call := client.Call{
+					Args:  request,
+					Reply: reply,
 				}
 				tc.wrapped.Send(call)
 				// If the transaction is not in pending state, then we can stop

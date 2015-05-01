@@ -31,7 +31,11 @@ func initFlags(ctx *server.Context) {
 	flag.StringVar(&ctx.Addr, "addr", ctx.Addr, "when run as the server the host:port to bind for "+
 		"HTTP/RPC traffic; when run as the client the address for connection to the cockroach cluster.")
 
-	flag.StringVar(&ctx.Certs, "certs", ctx.Certs, "directory containing RSA key and x509 certs.")
+	flag.BoolVar(&ctx.Insecure, "insecure", ctx.Insecure, "run over plain HTTP. WARNING: "+
+		"this is strongly discouraged.")
+
+	flag.StringVar(&ctx.Certs, "certs", ctx.Certs, "directory containing RSA key and x509 certs. "+
+		"This flag is required if -insecure=false.")
 
 	flag.StringVar(&ctx.Stores, "stores", ctx.Stores, "specify a comma-separated list of stores, "+
 		"specified by a colon-separated list of device attributes followed by '=' and "+
@@ -78,6 +82,11 @@ func initFlags(ctx *server.Context) {
 
 	flag.Int64Var(&ctx.CacheSize, "cache-size", ctx.CacheSize, "total size in bytes for "+
 		"caches, shared evenly if there are multiple storage devices.")
+
+	flag.DurationVar(&ctx.ScanInterval, "scan-interval", ctx.ScanInterval, "specify "+
+		"--scan_interval to adjust the target for the duration of a single scan "+
+		"through a store's ranges. The scan is slowed as necessary to approximately"+
+		"achieve this duration.")
 }
 
 func init() {
