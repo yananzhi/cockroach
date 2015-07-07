@@ -149,6 +149,28 @@ func (tc *TimestampCache) GetMax(start, end proto.Key, txnID []byte) (proto.Time
 	return maxR, maxW
 }
 
+// GetMin return true if the interval from start to end can be covered by overlap read caches,
+// and return the minimum of timestap of the read caches.
+func (tc *TimestampCache) GetMin(start, end proto.Key, txnID []byte) (bool, proto.Timestamp) {
+	// zhiyanan todo: check all overlap read caches, if the read caches  covered the interval
+	// from start to end, return the minimum of timestap
+	// for simple, just check has one read cache can contain the interval from start to end.
+
+	if len(end) == 0 {
+		end = start.Next()
+	}
+	for _, o := range tc.cache.GetOverlaps(start, end) {
+		ce := o.Value.(cacheEntry)
+		if ce.readOnly && (ce.txnID == nil || txnID == nil || !proto.TxnIDEqual(txnID, ce.txnID)) {
+			key := tc.cache.NewKey(start, end)
+			if o.Key.Contains(key) {
+				return true, ce.timestamp
+			}
+		}
+	}
+	return false, proto.MinTimestamp
+}
+
 // MergeInto merges all entries from this timestamp cache into the
 // dest timestamp cache. The clear parameter, if true, copies the
 // values of lowWater and latest and clears the destination cache

@@ -618,6 +618,21 @@ func (r *Range) addReadOnlyCmd(ctx context.Context, args proto.Request, reply pr
 		return reply.Header().GoError()
 	}
 
+	// If the timestamp of read command less than or equal  minTimestamp,
+	// don't add it to cmdQ and requre the leader lease.
+	r.Lock()
+	hasMin, min := r.tsCache.GetMin(header.Key, header.EndKey, header.Txn.GetID())
+	r.Unlock()
+
+	if hasMin && !header.Timestamp.Equal(proto.ZeroTimestamp) &&
+		(header.Timestamp.Less(min) || header.Timestamp.Equal(min)) {
+		intents, err := r.executeCmd(r.rm.Engine(), nil, args, reply)
+		if err == nil {
+			r.handleSkippedIntents(args, intents)
+		}
+		return err
+	}
+
 	// Add the read to the command queue to gate subsequent
 	// overlapping commands until this command completes.
 	cmdKey := r.beginCmd(header, true)

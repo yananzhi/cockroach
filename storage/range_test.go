@@ -337,11 +337,13 @@ func TestRangeReadConsistency(t *testing.T) {
 	gArgs.ReadConsistency = proto.CONSISTENT
 	gArgs.Txn = nil
 
-	err := tc.rng.AddCmd(tc.rng.context(), proto.Call{Args: gArgs, Reply: gReply})
-
-	if _, ok := err.(*proto.NotLeaderError); !ok {
-		t.Errorf("expected not leader error; got %s", err)
+	if err := tc.rng.AddCmd(tc.rng.context(), proto.Call{Args: gArgs, Reply: gReply}); err != nil {
+		t.Fatal(err)
 	}
+
+	//	if _, ok := err.(*proto.NotLeaderError); !ok {
+	//		t.Errorf("expected not leader error; got %s", err)
+	//	}
 
 	gArgs.ReadConsistency = proto.INCONSISTENT
 
